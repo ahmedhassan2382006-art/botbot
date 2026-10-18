@@ -27,7 +27,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # التوكن الخاص بك
-BOT_TOKEN = "8944046139:AAGfC_1T6PQVFbZ9MMJ73BmhUJKmW421gB0"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8944046139:AAGfC_1T6PQVFbZ9MMJ73BmhUJKmW421gB0")
 
 FILE_NEURAL_JSON = "neural_voices.json"
 FILE_FAST_JSON = "fast_voices.json"
