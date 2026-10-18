@@ -1,9 +1,17 @@
 name: Run Telegram TTS Bot
 
 on:
+  schedule:
+    # يعيد تشغيل نفسه كل 5 ساعات تلقائياً لضمان عدم توقفه
+    - cron: '0 */5 * * *'
   push:
     branches: [ main ]
   workflow_dispatch:
+
+# إيقاف النسخة القديمة تلقائياً وتشغيل النسخة الجديدة فوراً عند أي تعديل
+concurrency:
+  group: telegram-tts-bot
+  cancel-in-progress: true
 
 jobs:
   run-bot:
@@ -24,4 +32,6 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run Bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: python bot.py
