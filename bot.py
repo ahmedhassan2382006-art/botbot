@@ -35,16 +35,6 @@ except ImportError:
     HAS_SQLALCHEMY = False
 
 try:
-    from pypdf import PdfReader
-    HAS_PYPDF = True
-except ImportError:
-    try:
-        from PyPDF2 import PdfReader
-        HAS_PYPDF = True
-    except ImportError:
-        HAS_PYPDF = False
-
-try:
     from docx import Document as DocxDocument
     HAS_DOCX = True
 except ImportError:
@@ -80,8 +70,10 @@ DB_NEURAL = {}
 DB_FAST = {}
 DB_CREATIVE = {}
 
-USER_LAST_REQUEST = {}
-RATE_LIMIT_SECONDS = 3
+# ============ طابور المعالجة وإدارة العمليات ============
+USER_TASK_QUEUES = {}    # user_id -> asyncio.Queue
+USER_CURRENT_TASK = {}   # user_id -> filename / label
+USER_WORKERS = {}        # user_id -> asyncio.Task
 USER_LOCKS = {}
 
 MAX_CONCURRENT_TTS = 3
@@ -100,16 +92,10 @@ if HAS_SQLALCHEMY:
         config_json = Column(Text)
         created_at = Column(DateTime, default=datetime.utcnow)
 
-    class UserStats(Base):
-        __tablename__ = "user_stats"
-        user_id = Column(String, primary_key=True)
-        request_count = Column(Integer, default=0)
-        last_request = Column(DateTime, default=datetime.utcnow)
-
     Base.metadata.create_all(engine_db)
     SessionLocal = sessionmaker(bind=engine_db)
 
-# ============ حفظ واسترجاع إعدادات المستخدم الدائمة ============
+# ============ إعدادات المستخدم الدائمة ============
 def load_all_user_configs() -> dict:
     if os.path.exists(USER_CONFIG_FILE):
         try:
@@ -150,7 +136,7 @@ NATIVE_LANG_NAMES = {
 
 I18N = {
     "ar": {
-        "welcome": ("مرحباً بك في بوت تحويل النص إلى صوت الذكي!\n"
+        "welcome": ("مرحباً بك يا **{name}** في بوت تحويل النص إلى صوت الذكي!\n"
                     "المطور: **أحمد حسن عبد النبي** 👨‍💻\n\n"
                     "🔹 **الخطوة 1:** اختر المحرك الصوتي المطلوب:"),
         "step_engine": "🔹 **الخطوة 1:** اختر المحرك الصوتي:",
@@ -159,7 +145,7 @@ I18N = {
         "step_voice": "🔹 **الخطوة 4:** اختر الصوت:",
         "step_speed": "🔹 **اضبط إعدادات الصوت** (السرعة والنبرة):",
         "step_format": "🔹 **الخطوة 5:** اختر صيغة الملف الصوتي:",
-        "step_text": "🔹 **الخطوة 6:** أرسل النص (أو مستند .txt/.pdf/.docx/.srt):",
+        "step_text": "🔹 **الخطوة 6:** أرسل النص (أو مستند .docx/.txt/.srt):",
         "story_intro": "🎬 **محرك القصص والحوارات**\nاختر من 2 إلى 5 شخصيات.\nاختر المحرك الصوتي للشخصية الأولى (v1):",
         "story_slot_prompt": "🔹 اختر المحرك الصوتي للشخصية (v{num}):",
         "story_summary": "🎙️ **طاقم الحوار الحالي:**\nاضغط على أي شخصية أدناه إذا أردت **تعديلها**:",
@@ -169,21 +155,20 @@ I18N = {
         "story_step_text": ("🔹 **أرسل نص سيناريو الحوار.**\n\n"
                             "💡 **طريقة الكتابة:** ضع رمز الشخصية `(vالرقم)` في بداية كلامها:\n\n"
                             "*(v1) مرحباً يا أحمد، هل أتممت كتابة التقرير؟*\n"
-                            "*(v2) نعم يا سارة، انتهيت منه للتو وسأرسله لكِ الآن.*\n"
-                            "*(v1) ممتاز جداً، أشكرك!*"),
-        "multilang_intro": ("🌐 **محرك متعدد اللغات التلقائي**\n\n"
-                            "يتعرف تلقائياً على لغات النص ويوزع كل لغة على صوتها الأصلي في ملف واحد!\n"
-                            "⚠️ **الشرط:** (من 2 إلى 3 أصوات كحد أقصى) وكل صوت للغة مختلفة تماماً.\n\n"
+                            "*(v2) نعم يا سارة، انتهيت منه للتو وسأرسله لكِ الآن.*"),
+        "multilang_intro": ("🌐 **محرك متعدد اللغات التلقائي الذكي**\n\n"
+                            "يتعرف تلقائياً على لغات النص ويوزع كل لغة على صوتها الأصلي بدقة!\n"
                             "🔹 اختر المحرك الصوتي للغة الأولى:"),
         "multilang_slot_prompt": "🔹 اختر المحرك الصوتي للغة التالية:",
-        "multilang_summary": "🌐 **اللغات والأصوات المختارة حالياً:**\nاضغط على أي صوت أدناه إذا أردت **تعديلها**:",
+        "multilang_summary": "🌐 **اللغات والأصوات المختارة حالياً:**\nاضغط على أي صوت أدناه إذا أردت **تعديله**:",
         "multilang_btn_add": "➕ إضافة لغة وصوت إضافي (متبقي {num})",
         "multilang_btn_finish": "➡️ اعتماد اللغات والانتقال للصيغة",
         "multilang_btn_reset": "🔄 إعادة ضبط اللغات",
-        "multilang_step_text": ("🔹 **أرسل النص المختلط باللغات المتعددة الآن.**\n\n"
-                                "سيتعرف البوت تلقائياً على كل فقرة وجملة ولغتها، وينطقها بالصوت المخصص لها ثم يدمج الكل في ملف صوتي واحد متناسق."),
-        "generating": "⏳ **جاري معالجة الصوت بدقة...**",
-        "queue_waiting": "⏳ **طلبك مسجل في قائمة الانتظار، سيبدأ المعالجة فوراً...**",
+        "multilang_step_text": ("🔹 **أرسل النص الآن (أو مستند .docx/.txt/.srt).**\n\n"
+                                "سيتعرف البوت بذكاء على اللغات الموجودة وينطق كل جزء بصوته الطبيعي ثم يدمج الكل في ملف واحد متناسق."),
+        "generating": "⏳ **جاري معالجة الصوت بدقة عالية...**",
+        "queue_waiting": "⏳ **طلبك مسجل في قائمة الانتظار، سيبدأ فوراً...**",
+        "queue_multi_file": "⏳ هناك عملية جارية بالفعل على ملف **{curr}**.\nتم وضع ملفك الجديد **{new}** في قائمة الانتظار وسيبدأ تلقائياً فور الانتهاء.",
         "done": "✅ تم إنشاء ودمج الملف الصوتي بنجاح!",
         "new_text_hint": "\n\n💡 أرسل نصاً أو مستنداً جديداً في أي وقت وسأحوله لك بنفس الإعدادات مباشرة!",
         "back": "🔙 رجوع",
@@ -192,16 +177,9 @@ I18N = {
         "eng_creative": "المحرك التعبيري الحديث (شخصيات)",
         "eng_story": "محرك القصص والحوارات (سيناريو 2-5 أصوات) 🎬",
         "eng_multilang": "محرك متعدد اللغات (نطق آلي للغات بنص واحد) 🌐",
-        "error": "⚠️ حدث خطأ أثناء معالجة النص، تأكد من أن النص يحتوي على كلمات صالحة.",
-        "rate_limit": "⚠️ الرجاء الانتظار {wait} ثانية لتفادي الضغط.",
-        "busy": "⏳ لديك طلب قيد المعالجة حالياً، يرجى الانتظار حتى اكتماله.",
-        "preset_saved": "✅ تم حفظ القالب: **{name}**",
-        "preset_not_found": "❌ لم يتم العثور على القالب.",
-        "preset_loaded": "✅ تم تحميل القالب. أرسل النص الآن لتحويله:",
-        "no_presets": "📋 لا توجد قوالب محفوظة بعد. استخدم `/savepreset اسم` لحفظ الإعدادات الحالية.",
-        "preset_list": "📋 **قوالبك المحفوظة:**",
-        "doc_unsupported": "❌ صيغة الملف غير مدعومة. المدعوم: .txt .pdf .docx .srt",
-        "doc_no_text": "❌ لم يتم استخراج نص من الملف.",
+        "error": "⚠️ حدث خطأ أثناء معالجة الملف، تأكد من سلامة المحتوى والاتصال.",
+        "doc_unsupported": "❌ صيغة الملف غير مدعومة. الصيغ المعتمدة فقط: .docx .txt .srt",
+        "doc_no_text": "❌ لم يتم استخراج أي نص من الملف، تأكد أن الملف ليس فارغاً.",
         "doc_processing": "📥 جاري تنزيل الملف وقراءة النص بالخلفية...",
         "preview_caption": "🔊 عينة من الصوت المختار",
         "preview_generating": "⏳ جاري توليد عينة...",
@@ -212,10 +190,11 @@ I18N = {
         "preview_btn": "🔊 معاينة الصوت",
         "bgm_on": "🎵 موسيقى الخلفية: ✅ مفعلة",
         "bgm_off": "🎵 موسيقى الخلفية: ❌ معطلة",
-        "need_start": "🔹 مرحباً بك! يرجى إرسال /start لاختيار الصوت والصيغة قبل إرسال النصوص أو الملفات.",
+        "need_start": "🔹 مرحباً بك! يرجى إرسال /start لاختيار الصوت والصيغة أولاً.",
+        "part_label": "📦 **الجزء ({part} من {total})**\n",
     },
     "en": {
-        "welcome": ("Welcome to the Smart Text-to-Speech Bot!\n"
+        "welcome": ("Welcome **{name}** to the Smart Text-to-Speech Bot!\n"
                     "Developer: **Ahmed Hassan Abdelnaby** 👨‍💻\n\n"
                     "🔹 **Step 1:** Select the audio engine:"),
         "step_engine": "🔹 **Step 1:** Select the audio engine:",
@@ -224,7 +203,7 @@ I18N = {
         "step_voice": "🔹 **Step 4:** Select voice:",
         "step_speed": "🔹 **Audio Settings** (speed & pitch):",
         "step_format": "🔹 **Step 5:** Select audio format:",
-        "step_text": "🔹 **Step 6:** Send the text (or a .txt/.pdf/.docx/.srt document):",
+        "step_text": "🔹 **Step 6:** Send the text (or a .docx/.txt/.srt document):",
         "story_intro": "🎬 **Dialogue & Story Engine**\nChoose 2 to 5 characters.\nSelect engine for (v1):",
         "story_slot_prompt": "🔹 Select engine for character (v{num}):",
         "story_summary": "🎙️ **Current Story Cast:**\nTap any character below to **edit** it:",
@@ -234,23 +213,22 @@ I18N = {
         "story_step_text": ("🔹 **Send your dialogue script.**\n\n"
                             "💡 **Format:** Prefix turns with `(vNumber)`:\n\n"
                             "*(v1) Hello friend, how are you?*\n"
-                            "*(v2) I'm doing great, thank you!*\n"
-                            "*(v1) Wonderful to hear that!*"),
-        "multilang_intro": ("🌐 **Automatic Multilingual Engine**\n\n"
-                            "Automatically detects languages and switches voices natively!\n"
-                            "⚠️ **Rule:** (2 to 3 voices max), each voice different language.\n\n"
+                            "*(v2) I'm doing great, thank you!*"),
+        "multilang_intro": ("🌐 **Smart Multilingual Engine**\n\n"
+                            "Automatically detects languages and assigns native voices smoothly!\n"
                             "🔹 Select engine for the first language:"),
         "multilang_slot_prompt": "🔹 Select engine for the next language:",
         "multilang_summary": "🌐 **Configured languages & voices:**\nTap any voice below to **edit** it:",
         "multilang_btn_add": "➕ Add another language voice ({num} left)",
         "multilang_btn_finish": "➡️ Proceed with selected languages",
         "multilang_btn_reset": "🔄 Reset languages",
-        "multilang_step_text": ("🔹 **Send your mixed-language text now.**\n\n"
-                                "The bot will automatically detect each language segment and read it natively into one combined audio."),
-        "generating": "⏳ **Synthesizing audio carefully...**",
+        "multilang_step_text": ("🔹 **Send your text or file now (.docx/.txt/.srt).**\n\n"
+                                "The bot will smartly read each language with its native voice and merge everything seamlessly."),
+        "generating": "⏳ **Synthesizing studio-quality audio...**",
         "queue_waiting": "⏳ **Your request is queued. Starting shortly...**",
+        "queue_multi_file": "⏳ A task is currently running on **{curr}**.\nYour file **{new}** has been queued and will start automatically next.",
         "done": "✅ Audio generated and merged successfully!",
-        "new_text_hint": "\n\n💡 Send any new text or document anytime, and I will convert it directly using your saved settings!",
+        "new_text_hint": "\n\n💡 Send any new text or file anytime, and I will convert it directly using your saved settings!",
         "back": "🔙 Back",
         "eng_neural": "Ultra Neural Engine (Studio Quality)",
         "eng_fast": "Fast Standard Engine (Lightweight)",
@@ -258,14 +236,7 @@ I18N = {
         "eng_story": "Story & Dialogue Engine (2-5 Voices) 🎬",
         "eng_multilang": "Multilingual Engine (Auto Language Switch) 🌐",
         "error": "⚠️ An error occurred while generating audio.",
-        "rate_limit": "⚠️ Please wait {wait}s before your next request.",
-        "busy": "⏳ You already have a request in progress. Please wait.",
-        "preset_saved": "✅ Preset saved: **{name}**",
-        "preset_not_found": "❌ Preset not found.",
-        "preset_loaded": "✅ Preset loaded. Send the text to convert now:",
-        "no_presets": "📋 No presets saved yet. Use `/savepreset name` to save current settings.",
-        "preset_list": "📋 **Your saved presets:**",
-        "doc_unsupported": "❌ Unsupported format. Use: .txt .pdf .docx .srt",
+        "doc_unsupported": "❌ Unsupported format. Supported files: .docx .txt .srt",
         "doc_no_text": "❌ No text could be extracted from the file.",
         "doc_processing": "📥 Downloading file & reading in background...",
         "preview_caption": "🔊 Sample of the selected voice",
@@ -278,10 +249,11 @@ I18N = {
         "bgm_on": "🎵 Background Music: ✅ ON",
         "bgm_off": "🎵 Background Music: ❌ OFF",
         "need_start": "🔹 Welcome! Please type /start first to configure your voice settings.",
+        "part_label": "📦 **Part ({part} of {total})**\n",
     }
 }
 
-def t(update: Update, key: str) -> str:
+def t(update: Update, key: str, **kwargs) -> str:
     user_lang = "ar"
     try:
         if update.effective_user and update.effective_user.language_code:
@@ -289,7 +261,10 @@ def t(update: Update, key: str) -> str:
                 user_lang = "en"
     except Exception:
         pass
-    return I18N[user_lang].get(key, I18N["ar"].get(key, ""))
+    text = I18N[user_lang].get(key, I18N["ar"].get(key, ""))
+    if kwargs:
+        return text.format(**kwargs)
+    return text
 
 # ============ إدارة ملفات JSON ============
 async def init_neural_json():
@@ -543,7 +518,7 @@ async def synthesize_chunk(text: str, engine: str, voice: str, out_file: str,
             raise Exception("Creative TTS error")
 
 # ============ التقطيع الذكي والحصص القصوى ============
-def _sync_split_text_semantically(text: str, max_chars: int = 1500) -> list:
+def _sync_split_text_semantically(text: str, max_chars: int = 1000) -> list:
     clean_text = text.strip()
     if not clean_text:
         return []
@@ -584,11 +559,11 @@ def _sync_split_text_semantically(text: str, max_chars: int = 1500) -> list:
 
     return [r.strip() for r in result if r.strip()]
 
-async def split_text_semantically(text: str, max_chars: int = 1500) -> list:
+async def split_text_semantically(text: str, max_chars: int = 1000) -> list:
     return await asyncio.to_thread(_sync_split_text_semantically, text, max_chars)
 
 def partition_chunks_by_target_size(chunk_paths: list, audio_format: str) -> list:
-    MAX_SAFE_BYTES = 46 * 1024 * 1024
+    MAX_SAFE_BYTES = 46 * 1024 * 1024  # سقف أمان لتيليجرام (أقصى حد للبوتات 50 ميجا)
 
     if audio_format == "wav":
         max_batch_mp3_bytes = MAX_SAFE_BYTES / 5.5
@@ -618,7 +593,7 @@ def partition_chunks_by_target_size(chunk_paths: list, audio_format: str) -> lis
 
     return batches or [chunk_paths]
 
-# ============ كشف اللغة ============
+# ============ كشف اللغة بذكاء فائق ============
 def _classify_text_language_fallback(text: str, candidate_langs: list) -> str:
     if re.search(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]', text):
         for candidate in ["ar", "fa", "ur"]:
@@ -651,7 +626,7 @@ def _classify_text_language_fallback(text: str, candidate_langs: list) -> str:
         scores["es"] = es_chars * 10 + len(words & es_words) * 5
     if "fr" in candidate_langs:
         fr_chars = len(re.findall(r'[çèàêëîïôùû]', lower_text))
-        fr_words = {"le", "la", "les", "et", "de", "en", "un", "une", "du", "des", "pour", "avec", "est", "dans", "bonjour", "merci", "nous", "vous"}
+        fr_words = {"le", "la", "les", "et", "de", "en", "un", "una", "du", "des", "pour", "avec", "est", "dans", "bonjour", "merci", "nous", "vous"}
         scores["fr"] = fr_chars * 10 + len(words & fr_words) * 5
     if "de" in candidate_langs:
         de_chars = len(re.findall(r'[äöüß]', lower_text))
@@ -702,13 +677,7 @@ def _sync_parse_multilang_text(full_text: str, lang_slots: list):
                 idx = lang_to_idx.get(matched, 0)
                 segments.append((idx, sub))
 
-    merged = []
-    for idx, text in segments:
-        if merged and merged[-1][0] == idx:
-            merged[-1] = (idx, merged[-1][1] + " " + text)
-        else:
-            merged.append((idx, text))
-    return merged
+    return segments
 
 async def parse_multilang_text(full_text: str, lang_slots: list):
     return await asyncio.to_thread(_sync_parse_multilang_text, full_text, lang_slots)
@@ -728,15 +697,12 @@ def parse_story_dialogue(full_text: str, max_voices: int):
             segments.append((v_idx, content))
     return segments
 
-# ============ استخراج النص ============
+# ============ استخراج النص (حذف PDF تماماً) ============
 def _sync_extract_text(path: str, ext: str) -> str:
     try:
         if ext == ".txt":
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 return f.read()
-        if ext == ".pdf" and HAS_PYPDF:
-            reader = PdfReader(path)
-            return "\n".join((page.extract_text() or "") for page in reader.pages)
         if ext == ".docx" and HAS_DOCX:
             doc = DocxDocument(path)
             return "\n".join(p.text for p in doc.paragraphs)
@@ -757,11 +723,11 @@ def _sync_extract_text(path: str, ext: str) -> str:
 async def extract_text_from_file(path: str, ext: str) -> str:
     return await asyncio.to_thread(_sync_extract_text, path, ext)
 
-# ============ الأقفال والطوابير ============
-async def get_user_lock(user_id):
-    if user_id not in USER_LOCKS:
-        USER_LOCKS[user_id] = asyncio.Lock()
-    return USER_LOCKS[user_id]
+# ============ إدارة الطوابير ============
+def get_user_queue(user_id: int) -> asyncio.Queue:
+    if user_id not in USER_TASK_QUEUES:
+        USER_TASK_QUEUES[user_id] = asyncio.Queue()
+    return USER_TASK_QUEUES[user_id]
 
 def get_tts_semaphore():
     global GLOBAL_TTS_SEMAPHORE
@@ -772,6 +738,8 @@ def get_tts_semaphore():
 # ============ دورة عمل البوت ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
+    first_name = (update.effective_user.first_name or "صديقي") if update.effective_user else "صديقي"
+    
     keyboard = [
         [InlineKeyboardButton(t(update, "eng_neural"), callback_data="eng_neural")],
         [InlineKeyboardButton(t(update, "eng_fast"), callback_data="eng_fast")],
@@ -780,10 +748,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         [InlineKeyboardButton(t(update, "eng_story"), callback_data="eng_story")],
     ]
     markup = InlineKeyboardMarkup(keyboard)
+    welcome_msg = t(update, "welcome", name=first_name)
     if update.message:
-        await update.message.reply_text(t(update, "welcome"), reply_markup=markup, parse_mode="Markdown")
+        await update.message.reply_text(welcome_msg, reply_markup=markup, parse_mode="Markdown")
     else:
-        await update.callback_query.edit_message_text(t(update, "welcome"), reply_markup=markup, parse_mode="Markdown")
+        await update.callback_query.edit_message_text(welcome_msg, reply_markup=markup, parse_mode="Markdown")
     return STEP_ENGINE
 
 def build_lang_keyboard(lang_keys: list, db_dict: dict, page: int = 0):
@@ -858,7 +827,7 @@ async def show_sub_engines(update: Update, context: ContextTypes.DEFAULT_TYPE, s
         title = f"✏️ **تعديل الصوت رقم {editing_idx + 1}**\nاختر المحرك الصوتي الجديد:"
     else:
         if mode == "story":
-            title = t(update, "story_intro") if slot_num == 1 else t(update, "story_slot_prompt").format(num=slot_num)
+            title = t(update, "story_intro") if slot_num == 1 else t(update, "story_slot_prompt", num=slot_num)
         else:
             title = t(update, "multilang_intro") if slot_num == 1 else t(update, "multilang_slot_prompt")
     await query.edit_message_text(title, reply_markup=markup, parse_mode="Markdown")
@@ -1036,7 +1005,7 @@ async def show_story_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     for i, s in enumerate(slots):
         buttons.append([InlineKeyboardButton(f"✏️ (v{i+1}) {s['voice']}", callback_data=f"edit_story_{i}")])
     if len(slots) < 5:
-        buttons.append([InlineKeyboardButton(t(update, "story_btn_add").format(num=len(slots) + 1), callback_data="story_add")])
+        buttons.append([InlineKeyboardButton(t(update, "story_btn_add", num=len(slots) + 1), callback_data="story_add")])
     if len(slots) >= 2:
         buttons.append([InlineKeyboardButton(t(update, "story_btn_finish"), callback_data="story_finish")])
     buttons.append([InlineKeyboardButton(t(update, "story_btn_reset"), callback_data="story_reset")])
@@ -1069,7 +1038,7 @@ async def show_multilang_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
         buttons.append([InlineKeyboardButton(f"✏️ {i+1}️⃣ {s['label']}", callback_data=f"edit_mlang_{i}")])
     if len(slots) < 3:
         remaining = 3 - len(slots)
-        buttons.append([InlineKeyboardButton(t(update, "multilang_btn_add").format(num=remaining), callback_data="mlang_add")])
+        buttons.append([InlineKeyboardButton(t(update, "multilang_btn_add", num=remaining), callback_data="mlang_add")])
     if len(slots) >= 2:
         buttons.append([InlineKeyboardButton(t(update, "multilang_btn_finish"), callback_data="mlang_finish")])
     buttons.append([InlineKeyboardButton(t(update, "multilang_btn_reset"), callback_data="mlang_reset")])
@@ -1176,7 +1145,7 @@ async def preview_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     speed = context.user_data.get("speed", 1.0)
     pitch = context.user_data.get("pitch", "normal")
 
-    sample = "مرحباً بك، هذه عينة قصيرة من الصوت المختار."
+    sample = "مرحباً بك، هذه عينة من الصوت المختار."
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1215,7 +1184,6 @@ async def select_format(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     chosen_format = query.data.replace("fmt_", "")
     context.user_data["audio_format"] = chosen_format
 
-    # حفظ الإعدادات تلقائياً للمستخدم بشكل دائم
     save_user_config(str(update.effective_user.id), context.user_data)
 
     mode = context.user_data.get("mode", "single")
@@ -1228,64 +1196,74 @@ async def select_format(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     await query.edit_message_text(prompt_text, parse_mode="Markdown")
     return STEP_TEXT
 
-# ============ التوليد الرئيسي وطابور الانتظار ============
-async def generate_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, text_override: str = None) -> int:
-    user_id = update.effective_user.id
-    user_text = (text_override if text_override is not None else (update.message.text or "")).strip()
-    if not user_text:
-        await update.message.reply_text("⚠️ Empty text / النص فارغ.")
-        return STEP_TEXT
+# ============ عامل معالجة الطابور لكل مستخدم ============
+async def user_queue_worker(user_id: int):
+    q = get_user_queue(user_id)
+    while True:
+        task_data = await q.get()
+        if task_data is None:
+            break
+        update, context, text, task_label = task_data
+        USER_CURRENT_TASK[user_id] = task_label
+        try:
+            await execute_generation(update, context, text)
+        except Exception as e:
+            logger.error(f"Queue worker task error: {e}", exc_info=True)
+            try:
+                await update.message.reply_text(t(update, "error"))
+            except Exception:
+                pass
+        finally:
+            USER_CURRENT_TASK.pop(user_id, None)
+            q.task_done()
 
-    # استرجاع الإعدادات إن كانت مفقودة من الرام بسبب إعادة تشغيل السيرفر
+def ensure_user_worker(user_id: int):
+    worker = USER_WORKERS.get(user_id)
+    if worker is None or worker.done():
+        USER_WORKERS[user_id] = asyncio.create_task(user_queue_worker(user_id))
+
+# ============ إرسال المهمة إلى الطابور ============
+async def enqueue_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, task_label: str):
+    user_id = update.effective_user.id
+    ensure_user_worker(user_id)
+
+    # إذا كانت هناك مهمة قيد التنفيذ للمستخدم، يتم إشعاره بالانتظار فوراً
+    if user_id in USER_CURRENT_TASK:
+        curr_label = USER_CURRENT_TASK[user_id]
+        await update.message.reply_text(
+            t(update, "queue_multi_file", curr=curr_label, new=task_label),
+            parse_mode="Markdown"
+        )
+
+    q = get_user_queue(user_id)
+    await q.put((update, context, text, task_label))
+
+# ============ التنفيذ الفعلي لتوليد الصوت ============
+async def execute_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str):
+    user_id = str(update.effective_user.id)
     if "engine" not in context.user_data and "mode" not in context.user_data:
-        saved = get_saved_user_config(str(user_id))
+        saved = get_saved_user_config(user_id)
         if saved:
             context.user_data.update(saved)
         else:
             await update.message.reply_text(t(update, "need_start"))
-            return ConversationHandler.END
+            return
 
-    now = time.monotonic()
-    last = USER_LAST_REQUEST.get(user_id, 0)
-    if now - last < RATE_LIMIT_SECONDS:
-        wait = int(RATE_LIMIT_SECONDS - (now - last)) + 1
-        await update.message.reply_text(t(update, "rate_limit").format(wait=wait))
-        return STEP_TEXT
-    USER_LAST_REQUEST[user_id] = now
+    sem = get_tts_semaphore()
+    status_msg = await update.message.reply_text(t(update, "generating"), parse_mode="Markdown")
 
-    user_lock = await get_user_lock(user_id)
-    if user_lock.locked():
-        await update.message.reply_text(t(update, "busy"))
-        return STEP_TEXT
-
-    async with user_lock:
-        status_msg = None
-        sem = get_tts_semaphore()
-
-        if sem.locked():
-            status_msg = await update.message.reply_text(t(update, "queue_waiting"))
-
-        async with sem:
-            if status_msg:
-                try:
-                    await status_msg.edit_text(t(update, "generating"), parse_mode="Markdown")
-                except Exception:
-                    status_msg = await update.message.reply_text(t(update, "generating"), parse_mode="Markdown")
-            else:
-                status_msg = await update.message.reply_text(t(update, "generating"), parse_mode="Markdown")
-
+    async with sem:
+        try:
+            await _do_generate(update, context, user_text, status_msg)
+        except Exception as e:
+            logger.error(f"Generation error: {e}", exc_info=True)
             try:
-                await _do_generate(update, context, user_text, status_msg)
-            except Exception as e:
-                logger.error(f"Generation error: {e}", exc_info=True)
+                await status_msg.edit_text(t(update, "error"))
+            except Exception:
                 try:
-                    await status_msg.edit_text(t(update, "error"))
+                    await update.message.reply_text(t(update, "error"))
                 except Exception:
-                    try:
-                        await update.message.reply_text(t(update, "error"))
-                    except Exception:
-                        pass
-    return STEP_TEXT
+                    pass
 
 async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str, status_msg):
     mode = context.user_data.get("mode", "single")
@@ -1309,7 +1287,7 @@ async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
             segments = parse_story_dialogue(user_text, len(slots))
             for i, (v_idx, seg_text) in enumerate(segments):
                 slot = slots[v_idx]
-                sub_pieces = await split_text_semantically(seg_text, max_chars=1200)
+                sub_pieces = await split_text_semantically(seg_text, max_chars=1000)
                 for j, sp in enumerate(sub_pieces):
                     cf = os.path.join(tmpdir, f"chunk_{i}_{j}.mp3")
                     if await synthesize_chunk(sp, slot["engine"], slot["voice"], cf, speed=speed, pitch=pitch):
@@ -1323,9 +1301,12 @@ async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
             segments = await parse_multilang_text(user_text, slots)
             for i, (v_idx, seg_text) in enumerate(segments):
                 slot = slots[v_idx]
-                cf = os.path.join(tmpdir, f"chunk_{i}.mp3")
-                if await synthesize_chunk(seg_text, slot["engine"], slot["voice"], cf, speed=speed, pitch=pitch):
-                    chunks.append(cf)
+                # تقطيع ذكي داخل كل لغة لضمان عدم السقوط في النصوص الكبيرة
+                sub_pieces = await split_text_semantically(seg_text, max_chars=1000)
+                for j, sp in enumerate(sub_pieces):
+                    cf = os.path.join(tmpdir, f"chunk_ml_{i}_{j}.mp3")
+                    if await synthesize_chunk(sp, slot["engine"], slot["voice"], cf, speed=speed, pitch=pitch):
+                        chunks.append(cf)
             if not chunks:
                 raise Exception("No chunks generated")
             caption_details = f"🌐 **{len(slots)} languages** | ⚡{speed}x"
@@ -1333,7 +1314,7 @@ async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
         else:
             engine = context.user_data.get("engine", "neural")
             voice = context.user_data.get("voice", "ar-EG-SalmaNeural")
-            text_chunks = await split_text_semantically(user_text, max_chars=1200)
+            text_chunks = await split_text_semantically(user_text, max_chars=1000)
             if not text_chunks:
                 raise Exception("Empty text")
             for i, tch in enumerate(text_chunks):
@@ -1355,7 +1336,7 @@ async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
                 include_silence_between=include_silence, add_bgm=add_bgm
             )
 
-            part_label = f"📦 **الجزء ({part_idx} من {total_parts})**\n" if total_parts > 1 else ""
+            part_label = t(update, "part_label", part=part_idx, total=total_parts) if total_parts > 1 else ""
             is_last = (part_idx == total_parts)
             hint = t(update, 'new_text_hint') if is_last else ""
             caption = f"{t(update, 'done')}\n{part_label}{caption_details}\n📁 `{audio_format.upper()}`{hint}"
@@ -1375,32 +1356,31 @@ async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
         except Exception:
             pass
 
-# ============ معالجة المستندات ============
+# ============ معالجة النصوص والمستندات ============
+async def generate_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_text = (update.message.text or "").strip()
+    if not user_text:
+        await update.message.reply_text("⚠️ النص فارغ.")
+        return STEP_TEXT
+
+    label = user_text[:20] + "..." if len(user_text) > 20 else user_text
+    await enqueue_generation(update, context, user_text, task_label=label)
+    return STEP_TEXT
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = str(update.effective_user.id)
     doc = update.message.document
     if not doc:
         return STEP_TEXT
     file_name = doc.file_name or "file.txt"
     ext = os.path.splitext(file_name)[1].lower()
-    if ext not in (".txt", ".pdf", ".docx", ".srt"):
+    
+    # حظر PDF كلياً وحصر الصيغ على docx, txt, srt
+    if ext not in (".txt", ".docx", ".srt"):
         await update.message.reply_text(t(update, "doc_unsupported"))
-        return STEP_TEXT
-    if ext == ".pdf" and not HAS_PYPDF:
-        await update.message.reply_text("❌ pypdf غير مثبت لقراءة PDF.")
         return STEP_TEXT
     if ext == ".docx" and not HAS_DOCX:
         await update.message.reply_text("❌ python-docx غير مثبت لقراءة DOCX.")
         return STEP_TEXT
-
-    # استرجاع الإعدادات إن كانت مفقودة
-    if "engine" not in context.user_data and "mode" not in context.user_data:
-        saved = get_saved_user_config(user_id)
-        if saved:
-            context.user_data.update(saved)
-        else:
-            await update.message.reply_text(t(update, "need_start"))
-            return ConversationHandler.END
 
     status = await update.message.reply_text(t(update, "doc_processing"))
     tmpdir = tempfile.mkdtemp()
@@ -1413,7 +1393,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await status.edit_text(t(update, "doc_no_text"))
             return STEP_TEXT
         await status.delete()
-        return await generate_audio(update, context, text_override=text)
+        await enqueue_generation(update, context, text, task_label=file_name)
+        return STEP_TEXT
     except Exception as e:
         logger.error(f"Document error: {e}")
         try:
@@ -1424,7 +1405,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-# ============ المعالجات المباشرة (لحالات بعد إعادة التشغيل) ============
+# ============ المعالجات المباشرة (خارج المحادثة) ============
 async def direct_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     saved = get_saved_user_config(user_id)
@@ -1443,78 +1424,6 @@ async def direct_document_handler(update: Update, context: ContextTypes.DEFAULT_
     else:
         await update.message.reply_text(t(update, "need_start"))
 
-# ============ القوالب (Presets) ============
-def _sync_save_preset(user_id, name, config_json):
-    with SessionLocal() as db:
-        preset = UserPreset(user_id=user_id, name=name, config_json=config_json)
-        db.add(preset)
-        db.commit()
-
-async def save_preset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not HAS_SQLALCHEMY:
-        await update.message.reply_text("❌ Database unavailable.")
-        return
-    user_id = str(update.effective_user.id)
-    name = " ".join(context.args).strip() if context.args else f"Preset_{int(time.time())}"
-
-    config = {k: context.user_data[k] for k in (
-        "mode", "engine", "voice", "voice_name", "selected_lang", "selected_dia",
-        "audio_format", "speed", "pitch", "add_bgm", "story_slots", "multilang_slots"
-    ) if k in context.user_data}
-
-    await asyncio.to_thread(_sync_save_preset, user_id, name, json.dumps(config, ensure_ascii=False))
-    await update.message.reply_text(t(update, "preset_saved").format(name=name), parse_mode="Markdown")
-
-def _sync_get_presets(user_id):
-    with SessionLocal() as db:
-        return db.query(UserPreset).filter_by(user_id=user_id).all()
-
-async def presets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not HAS_SQLALCHEMY:
-        await update.message.reply_text("❌ Database unavailable.")
-        return
-    user_id = str(update.effective_user.id)
-    presets = await asyncio.to_thread(_sync_get_presets, user_id)
-    if not presets:
-        await update.message.reply_text(t(update, "no_presets"))
-        return
-    buttons = [[InlineKeyboardButton(f"📁 {p.name}", callback_data=f"loadpreset_{p.id}")] for p in presets]
-    await update.message.reply_text(t(update, "preset_list"), reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
-
-def _sync_load_preset(preset_id, user_id):
-    with SessionLocal() as db:
-        return db.query(UserPreset).filter_by(id=preset_id, user_id=user_id).first()
-
-async def load_preset_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    if not HAS_SQLALCHEMY:
-        await query.edit_message_text("❌ Database unavailable.")
-        return ConversationHandler.END
-    try:
-        preset_id = int(query.data.replace("loadpreset_", ""))
-    except ValueError:
-        return ConversationHandler.END
-    user_id = str(query.from_user.id)
-    preset = await asyncio.to_thread(_sync_load_preset, preset_id, user_id)
-    if not preset:
-        await query.edit_message_text(t(update, "preset_not_found"))
-        return ConversationHandler.END
-    config = json.loads(preset.config_json or "{}")
-
-    context.user_data.clear()
-    for k, v in config.items():
-        if v is not None:
-            context.user_data[k] = v
-    if context.user_data.get("multilang_slots"):
-        context.user_data["used_langs"] = {s["lang"] for s in context.user_data["multilang_slots"]}
-
-    # حفظ في إعدادات المستخدم التلقائية
-    save_user_config(user_id, context.user_data)
-
-    await query.edit_message_text(t(update, "preset_loaded"))
-    return STEP_TEXT
-
 async def noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.callback_query.answer()
@@ -1525,18 +1434,20 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("تم الإلغاء. اكتب /start للبدء مجدداً.")
     return ConversationHandler.END
 
-# ============ الإغلاق والتشغيل النظيف ============
+# ============ التشغيل والإغلاق ============
 async def on_startup(app):
     print("⏳ جاري تحضير وفحص قواعد بيانات المحركات...")
     await init_neural_json()
     init_fast_json()
     init_creative_json()
-    print("✅ تم تجهيز قواعد البيانات وتشغيل البوت بنجاح وبأقصى سرعة تزامن!")
+    print("✅ تم تجهيز قواعد البيانات وتشغيل البوت الذكي بنجاح!")
 
 async def on_shutdown(app):
     global GLOBAL_HTTP_SESSION
     if GLOBAL_HTTP_SESSION and not GLOBAL_HTTP_SESSION.closed:
         await GLOBAL_HTTP_SESSION.close()
+    for worker in USER_WORKERS.values():
+        worker.cancel()
 
 def main():
     app = (
@@ -1554,7 +1465,6 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
-            CallbackQueryHandler(load_preset_callback, pattern=r"^loadpreset_\d+$"),
         ],
         states={
             STEP_ENGINE: [CallbackQueryHandler(select_engine, pattern="^eng_")],
@@ -1586,14 +1496,11 @@ def main():
     )
 
     app.add_handler(conv_handler)
-    app.add_handler(CommandHandler("savepreset", save_preset_cmd))
-    app.add_handler(CommandHandler("presets", presets_cmd))
-
-    # معالجات مباشرة تضمن أن البوت يستجيب لأي ملف أو نص حتى لو انتهت المحادثة أو أعيد تشغيل الجلسة
+    # معالجات مباشرة تضمن العمل التلقائي حتى بعد إعادة تشغيل الجلسات
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, direct_message_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, direct_document_handler))
 
-    print("🚀 البوت متصل وجاهز للعمل تحت أقصى ضغط...")
+    print("🚀 البوت متصل وجاهز للعمل بأقصى ذكاء وتزامن...")
     app.run_polling(close_loop=False, drop_pending_updates=True)
 
 if __name__ == "__main__":
