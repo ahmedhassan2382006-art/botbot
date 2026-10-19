@@ -2,18 +2,16 @@ name: Run Telegram TTS Bot
 
 on:
   schedule:
-    # إعادة تشغيل البوت تلقائياً كل 5 ساعات لضمان العمل المستمر (موجود وشغال 100%)
+    # إعادة تشغيل البوت تلقائياً كل 5 ساعات لضمان العمل المستمر
     - cron: '0 */5 * * *'
   push:
     branches: [ main ]
   workflow_dispatch:
 
-# إعطاء الصلاحيات للتحكم بالعمليات وإلغاء القديم
 permissions:
   actions: write
   contents: read
 
-# منع التضارب والتأكد من وجود جلسة واحدة فقط نشطة
 concurrency:
   group: telegram-tts-bot
   cancel-in-progress: true
@@ -23,11 +21,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # الخطوة 1: جلب كود المشروع
+      # الخطوة 1: استدعاء ملفات المشروع
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # الخطوة 2: إغلاق وقتل أي عملية سابقة فوراً لمنع التكرار
+      # الخطوة 2: إغلاق أي جلسات سابقة
       - name: Cancel all other running workflows
         env:
           GH_TOKEN: ${{ github.token }}
@@ -48,20 +46,20 @@ jobs:
           echo "تم تنظيف كل الجلسات القديمة بنجاح!"
           sleep 3
 
-      # الخطوة 3: تثبيت بيئة بايثون مع تفعيل الكاش (يمنع إعادة تحميل المكتبات كل مرة)
+      # الخطوة 3: تثبيت FFmpeg من مستودعات أوبنتو الرسمية مباشرة وبشكل فائق السرعة
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
+      # الخطوة 4: تثبيت بايثون مع الكاش لتسريع تثبيت المكتبات
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
 
-      # الخطوة 4: تجهيز أداة FFmpeg لمعالجة الصوت في ثوانٍ معدودة وبدون رفع ملفات
-      - name: Setup FFmpeg
-        uses: FedericoCarboni/setup-ffmpeg@v3
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      # الخطوة 5: تثبيت المكتبات (سيتم جلبها سريعاً من الكاش بعد أول جلسة)
+      # الخطوة 5: تثبيت مكتبات بايثون
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
