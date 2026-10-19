@@ -2,3 +2,7 @@ python-telegram-bot==20.8
 edge-tts
 gTTS
 aiohttp
+langdetect
+SQLAlchemy
+pypdf
+python-docx
