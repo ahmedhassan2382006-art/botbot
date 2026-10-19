@@ -144,7 +144,7 @@ I18N = {
                             "⚠️ **الشرط:** (من 2 إلى 3 أصوات كحد أقصى) وكل صوت للغة مختلفة تماماً.\n\n"
                             "🔹 اختر المحرك الصوتي للغة الأولى:"),
         "multilang_slot_prompt": "🔹 اختر المحرك الصوتي للغة التالية:",
-        "multilang_summary": "🌐 **اللغات والأصوات المختارة حالياً:**\nاضغط على أي صوت أدناه إذا أردت **تعديله**:",
+        "multilang_summary": "🌐 **اللغات والأصوات المختارة حالياً:**\nاضغط على أي صوت أدناه إذا أردت **تعديلها**:",
         "multilang_btn_add": "➕ إضافة لغة وصوت إضافي (متبقي {num})",
         "multilang_btn_finish": "➡️ اعتماد اللغات والانتقال للصيغة",
         "multilang_btn_reset": "🔄 إعادة ضبط اللغات",
@@ -255,7 +255,7 @@ def t(update: Update, key: str) -> str:
         pass
     return I18N[user_lang].get(key, I18N["ar"].get(key, ""))
 
-# ============ إدارة ملفات JSON (كما هي) ============
+# ============ إدارة ملفات JSON ============
 async def init_neural_json():
     global DB_NEURAL
     if os.path.exists(FILE_NEURAL_JSON):
@@ -348,7 +348,7 @@ def init_creative_json():
     DB_CREATIVE = db
 
 # ============ دوال مساعدة FFmpeg ============
-async def run_ffmpeg(args: list, timeout: int = 120) -> bool:
+async def run_ffmpeg(args: list, timeout: int = 180) -> bool:
     """تشغيل ffmpeg بشكل غير متزامن"""
     if not shutil.which("ffmpeg"):
         return False
@@ -404,7 +404,6 @@ async def merge_audio_files(file_list: list, output_file: str, audio_format: str
 
     tmpdir = os.path.dirname(output_file) or "."
     if not shutil.which("ffmpeg"):
-        # تراجع آمن: دمج ثنائي خام (يُستخدم فقط عند غياب ffmpeg)
         with open(output_file, "wb") as out:
             for fp in valid:
                 with open(fp, "rb") as f:
@@ -422,7 +421,7 @@ async def merge_audio_files(file_list: list, output_file: str, audio_format: str
         if ok and os.path.exists(nfp) and os.path.getsize(nfp) > 0:
             normalized.append(nfp)
         else:
-            normalized.append(fp)  # تراجع آمن
+            normalized.append(fp)
 
     if not normalized:
         raise Exception("Normalization failed")
@@ -489,7 +488,6 @@ async def synthesize_chunk(text: str, engine: str, voice: str, out_file: str,
         return True
 
     elif engine == "fast":
-        # إصلاح: تحويل gTTS إلى to_thread لمنع تجميد asyncio
         tts = gTTS(text=clean_text, lang=voice)
         await asyncio.to_thread(tts.save, out_file)
         if abs(speed - 1.0) > 0.01:
@@ -512,6 +510,83 @@ async def synthesize_chunk(text: str, engine: str, voice: str, out_file: str,
                             os.replace(spd_out, out_file)
                     return True
                 raise Exception("Creative TTS error")
+
+# ============ دوال التقطيع الذكي والحصص القصوى ============
+def split_text_semantically(text: str, max_chars: int = 1500) -> list:
+    """تقطيع النص إلى فقرات وجمل كاملة دون قطع في منتصف الكلمة أو الجملة"""
+    clean_text = text.strip()
+    if not clean_text:
+        return []
+
+    paragraphs = [p.strip() for p in clean_text.splitlines() if p.strip()]
+    if not paragraphs:
+        paragraphs = [clean_text]
+
+    result = []
+    current_chunk = []
+    current_len = 0
+
+    for p in paragraphs:
+        if len(p) > max_chars:
+            # تقطيع عند علامات الترقيم ونهايات الجمل
+            sentences = re.split(r'(?<=[.!?؟،؛\n])\s+', p)
+            for s in sentences:
+                s = s.strip()
+                if not s:
+                    continue
+                if current_len + len(s) > max_chars and current_chunk:
+                    result.append(" ".join(current_chunk))
+                    current_chunk = [s]
+                    current_len = len(s)
+                else:
+                    current_chunk.append(s)
+                    current_len += len(s)
+        else:
+            if current_len + len(p) > max_chars and current_chunk:
+                result.append("\n".join(current_chunk))
+                current_chunk = [p]
+                current_len = len(p)
+            else:
+                current_chunk.append(p)
+                current_len += len(p)
+
+    if current_chunk:
+        result.append("\n".join(current_chunk))
+
+    return [r.strip() for r in result if r.strip()]
+
+def partition_chunks_by_target_size(chunk_paths: list, audio_format: str) -> list:
+    """تقسيم المقاطع لمجموعات تستغل الحد الأقصى المسموح (حوالي 46 ميجابايت) دون تجاوزه"""
+    MAX_SAFE_BYTES = 46 * 1024 * 1024  # سقف أمان دون حد 50 ميجا المسموح للبوتات
+
+    if audio_format == "wav":
+        # ملفات WAV غير مضغوطة وحجمها أكبر بنحو 5.5 مرة من MP3
+        max_batch_mp3_bytes = MAX_SAFE_BYTES / 5.5
+    elif audio_format == "ogg":
+        max_batch_mp3_bytes = MAX_SAFE_BYTES * 1.5
+    else:  # mp3
+        max_batch_mp3_bytes = MAX_SAFE_BYTES * 0.95
+
+    batches = []
+    current_batch = []
+    current_size = 0
+
+    for cp in chunk_paths:
+        if not os.path.exists(cp):
+            continue
+        c_size = os.path.getsize(cp)
+        if current_batch and (current_size + c_size > max_batch_mp3_bytes):
+            batches.append(current_batch)
+            current_batch = [cp]
+            current_size = c_size
+        else:
+            current_batch.append(cp)
+            current_size += c_size
+
+    if current_batch:
+        batches.append(current_batch)
+
+    return batches or [chunk_paths]
 
 # ============ كشف اللغة والتحليل ============
 def _classify_text_language_fallback(text: str, candidate_langs: list) -> str:
@@ -591,10 +666,8 @@ def parse_multilang_text(full_text: str, lang_slots: list):
     candidate_langs = [s["lang"] for s in lang_slots]
     lang_to_idx = {s["lang"]: i for i, s in enumerate(lang_slots)}
     segments = []
-    # تقسيم النص بناءً على نهايات الجمل + الأسطر
     raw_lines = [line.strip() for line in full_text.splitlines() if line.strip()]
     for line in raw_lines:
-        # تقسيم ذكي حسب علامات الترقيم (Smart Boundary Splitting)
         sub_sentences = re.split(r'(?<=[.!?،؟])\s+', line)
         for sub in sub_sentences:
             sub = sub.strip()
@@ -698,7 +771,6 @@ def build_lang_keyboard(lang_keys: list, db_dict: dict, page: int = 0):
     return InlineKeyboardMarkup(buttons)
 
 def build_voice_keyboard(voices: list, page: int = 0, page_size: int = 8):
-    """ترقيم صفحات الأصوات"""
     total_pages = max(1, (len(voices) + page_size - 1) // page_size)
     current = voices[page * page_size: (page + 1) * page_size]
     buttons, row = [], []
@@ -716,7 +788,7 @@ def build_voice_keyboard(voices: list, page: int = 0, page_size: int = 8):
         nav.append(InlineKeyboardButton("➡️", callback_data=f"vpage_{page+1}"))
     if nav:
         buttons.append(nav)
-    buttons.append([InlineKeyboardButton("🔙 " + t(None, "back") if False else "🔙 Back", callback_data="back_to_lang")])
+    buttons.append([InlineKeyboardButton("🔙 Back", callback_data="back_to_lang")])
     return InlineKeyboardMarkup(buttons)
 
 async def select_engine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1123,7 +1195,6 @@ async def generate_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
         await update.message.reply_text("⚠️ Empty text / النص فارغ.")
         return STEP_TEXT
 
-    # Rate limiting
     now = time.monotonic()
     last = USER_LAST_REQUEST.get(user_id, 0)
     if now - last < RATE_LIMIT_SECONDS:
@@ -1168,27 +1239,27 @@ async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
                 pass
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            final_path = os.path.join(tmpdir, f"final.{audio_format}")
+            chunks = []
+            caption_details = ""
 
             if mode == "story":
                 slots = context.user_data.get("story_slots", [])
                 segments = parse_story_dialogue(user_text, len(slots))
-                chunks = []
                 for i, (v_idx, seg_text) in enumerate(segments):
                     slot = slots[v_idx]
-                    cf = os.path.join(tmpdir, f"chunk_{i}.mp3")
-                    if await synthesize_chunk(seg_text, slot["engine"], slot["voice"], cf, speed=speed, pitch=pitch):
-                        chunks.append(cf)
+                    # التقطيع الذكي داخل كل حوار طويل
+                    sub_pieces = split_text_semantically(seg_text, max_chars=1200)
+                    for j, sp in enumerate(sub_pieces):
+                        cf = os.path.join(tmpdir, f"chunk_{i}_{j}.mp3")
+                        if await synthesize_chunk(sp, slot["engine"], slot["voice"], cf, speed=speed, pitch=pitch):
+                            chunks.append(cf)
                 if not chunks:
                     raise Exception("No chunks generated")
-                await merge_audio_files(chunks, final_path, audio_format=audio_format,
-                                       include_silence_between=True, add_bgm=add_bgm)
                 caption_details = f"🎬 **{len(slots)} characters** | ⚡{speed}x"
 
             elif mode == "multilang":
                 slots = context.user_data.get("multilang_slots", [])
                 segments = parse_multilang_text(user_text, slots)
-                chunks = []
                 for i, (v_idx, seg_text) in enumerate(segments):
                     slot = slots[v_idx]
                     cf = os.path.join(tmpdir, f"chunk_{i}.mp3")
@@ -1196,39 +1267,65 @@ async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
                         chunks.append(cf)
                 if not chunks:
                     raise Exception("No chunks generated")
-                await merge_audio_files(chunks, final_path, audio_format=audio_format, add_bgm=add_bgm)
                 caption_details = f"🌐 **{len(slots)} languages** | ⚡{speed}x"
 
             else:
                 engine = context.user_data.get("engine", "neural")
                 voice = context.user_data.get("voice", "ar-EG-SalmaNeural")
-                raw = os.path.join(tmpdir, "raw.mp3")
-                if not await synthesize_chunk(user_text, engine, voice, raw, speed=speed, pitch=pitch):
+                # التقطيع الذكي عند الفقرات والجمل
+                text_chunks = split_text_semantically(user_text, max_chars=1200)
+                if not text_chunks:
+                    raise Exception("Empty text")
+                for i, tch in enumerate(text_chunks):
+                    cf = os.path.join(tmpdir, f"chunk_{i}.mp3")
+                    if await synthesize_chunk(tch, engine, voice, cf, speed=speed, pitch=pitch):
+                        chunks.append(cf)
+                if not chunks:
                     raise Exception("Synthesis failed")
-                await merge_audio_files([raw], final_path, audio_format=audio_format, add_bgm=add_bgm)
                 caption_details = f"🎙️ `{voice}` | ⚡{speed}x"
 
+            # تقسيم المقاطع لاستغلال الحد الأقصى للملف الواحد (حتى 46MB بأمان)
+            batches = partition_chunks_by_target_size(chunks, audio_format)
+            total_parts = len(batches)
+
+            for part_idx, batch_chunks in enumerate(batches, 1):
+                part_path = os.path.join(tmpdir, f"part_{part_idx}.{audio_format}")
+                include_silence = (mode == "story")
+                await merge_audio_files(
+                    batch_chunks, part_path, audio_format=audio_format,
+                    include_silence_between=include_silence, add_bgm=add_bgm
+                )
+
+                part_label = f"📦 **الجزء ({part_idx} من {total_parts})**\n" if total_parts > 1 else ""
+                is_last = (part_idx == total_parts)
+                hint = t(update, 'new_text_hint') if is_last else ""
+                caption = f"{t(update, 'done')}\n{part_label}{caption_details}\n📁 `{audio_format.upper()}`{hint}"
+
+                with open(part_path, "rb") as audio_file:
+                    if audio_format == "ogg":
+                        await update.message.reply_voice(voice=audio_file, caption=caption, parse_mode="Markdown")
+                    else:
+                        title_str = f"Audio Part {part_idx}" if total_parts > 1 else "Audio Recording"
+                        await update.message.reply_audio(
+                            audio=audio_file, title=title_str,
+                            performer="Smart TTS Engine", caption=caption, parse_mode="Markdown"
+                        )
+
+            # حذف رسالة الانتظار فقط بعد اكتمال الإرسال بنجاح
             try:
                 await status_msg.delete()
             except Exception:
                 pass
 
-            caption = f"{t(update, 'done')}\n{caption_details}\n📁 `{audio_format.upper()}`{t(update, 'new_text_hint')}"
-
-            with open(final_path, "rb") as audio_file:
-                if audio_format == "ogg":
-                    await update.message.reply_voice(voice=audio_file, caption=caption, parse_mode="Markdown")
-                else:
-                    await update.message.reply_audio(
-                        audio=audio_file, title="Audio Recording",
-                        performer="Smart TTS Engine", caption=caption, parse_mode="Markdown"
-                    )
     except Exception as e:
         logger.error(f"TTS generation error: {e}", exc_info=True)
         try:
             await status_msg.edit_text(t(update, "error"))
         except Exception:
-            pass
+            try:
+                await update.message.reply_text(t(update, "error"))
+            except Exception:
+                pass
 
 # ============ معالجة المستندات ============
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1350,7 +1447,16 @@ async def on_startup(app):
     print("✅ تم تجهيز قواعد البيانات وتشغيل البوت بنجاح!")
 
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(on_startup).build()
+    # تمديد مهل الاتصال والرفع (Timeouts) للتعامل السلس مع الملفات الصوتية الكبيرة
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .read_timeout(300)
+        .write_timeout(300)
+        .connect_timeout(60)
+        .post_init(on_startup)
+        .build()
+    )
 
     conv_handler = ConversationHandler(
         entry_points=[
@@ -1387,7 +1493,6 @@ def main():
     )
 
     app.add_handler(conv_handler)
-    # أوامر القوالب (خارج المحادثة)
     app.add_handler(CommandHandler("savepreset", save_preset_cmd))
     app.add_handler(CommandHandler("presets", presets_cmd))
 
