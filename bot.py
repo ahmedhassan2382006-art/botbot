@@ -19,7 +19,7 @@ from telegram import (
 )
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ContextTypes, ConversationHandler, ChatMemberHandler, filters
+    MessageHandler, ContextTypes, ConversationHandler, filters
 )
 
 # ============ مكتبات اختيارية ============
@@ -45,14 +45,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ============ إعدادات البيئة ============
+# ============ إعدادات البيئة والاشتراك الإجباري الثابت ============
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "ضع_توكن_البوت_هنا")
 
-# قنوات ومجموعة الاشتراك الإجباري
+# قنوات الاشتراك الإجباري الرسمية
 CHANNELS_TO_CHECK = [
     {"name": "قناة الشروحات التقنية 💡", "id": "@Basira_Tech", "link": "https://t.me/Basira_Tech"},
     {"name": "قناة مشاريع المطور 👨‍💻", "id": "@AhmedHassanProjects", "link": "https://t.me/AhmedHassanProjects"},
 ]
+
+# المعرف الرقمي الثابت لمجموعة النقاش ورابطها
+GROUP_CHAT_ID = -1003997349654
 GROUP_INVITE_LINK = "https://t.me/+6e6e1QVB4z8xMGE0"
 
 DB_FILE = "bot_database.db"
@@ -104,29 +107,8 @@ def init_db():
             last_active TIMESTAMP
         )
     """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS bot_settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
     conn.commit()
     conn.close()
-
-def db_set_setting(key: str, value: str):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("INSERT OR REPLACE INTO bot_settings (key, value) VALUES (?, ?)", (key, str(value)))
-    conn.commit()
-    conn.close()
-
-def db_get_setting(key: str, default=None):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM bot_settings WHERE key = ?", (key,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else default
 
 def db_touch_user(user_id: str, config: dict = None):
     conn = sqlite3.connect(DB_FILE)
@@ -179,7 +161,7 @@ def db_prune_inactive(days: int = 10):
     except Exception as e:
         logger.error(f"خطأ تنظيف الحسابات: {e}")
 
-# ============ فحص الاشتراك الصارم والدقيق ============
+# ============ فحص الاشتراك الصارم والمغلق ============
 async def check_user_subscription(bot, user_id: int) -> tuple[bool, list]:
     missing = []
     
@@ -193,22 +175,18 @@ async def check_user_subscription(bot, user_id: int) -> tuple[bool, list]:
                 missing.append(ch)
         except Exception as e:
             logger.error(f"⚠️ تنبيه التحقق: تعذر فحص القناة {ch['id']}: {e}")
-            logger.error("👉 تأكد من إضافة البوت كمشرف (Admin) داخل القناة لتسمح له تليجرام بفحص المشتركين!")
-            # إذا تعذر الفحص بسبب أن المستخدم ليس بالقناة فعلاً
             missing.append(ch)
 
-    # 2. فحص المجموعة الرسمية
-    group_id = db_get_setting("tracked_group_id", os.environ.get("GROUP_CHAT_ID"))
-    if group_id:
-        try:
-            g_member = await bot.get_chat_member(chat_id=int(group_id) if str(group_id).lstrip('-').isdigit() else group_id, user_id=user_id)
-            if g_member.status in [ChatMember.LEFT, ChatMember.BANNED]:
-                missing.append({"name": "مجموعة النقاش والتعليقات 💬", "link": GROUP_INVITE_LINK})
-        except Exception as e:
-            logger.warning(f"تعذر فحص المجموعة {group_id}: {e}")
+    # 2. فحص المجموعة الرسمية بالمعرف الثابت
+    try:
+        g_member = await bot.get_chat_member(chat_id=GROUP_CHAT_ID, user_id=user_id)
+        if g_member.status in [ChatMember.LEFT, ChatMember.BANNED]:
             missing.append({"name": "مجموعة النقاش والتعليقات 💬", "link": GROUP_INVITE_LINK})
-    else:
-        # إذا لم يُسجل معرف المجموعة بعد، نطلب منه الانضمام عبر الرابط
+        elif g_member.status not in [ChatMember.MEMBER, ChatMember.ADMINISTRATOR, ChatMember.OWNER, ChatMember.RESTRICTED]:
+            missing.append({"name": "مجموعة النقاش والتعليقات 💬", "link": GROUP_INVITE_LINK})
+    except Exception as e:
+        logger.error(f"⚠️ تنبيه التحقق: تعذر فحص المجموعة {GROUP_CHAT_ID}: {e}")
+        # شرط صارم: إذا لم نتمكن من التحقق من وجوده في المجموعة يُمنع من الدخول
         missing.append({"name": "مجموعة النقاش والتعليقات 💬", "link": GROUP_INVITE_LINK})
 
     return (len(missing) == 0, missing)
@@ -220,7 +198,7 @@ async def gatekeeper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool
         
     db_touch_user(str(user.id))
     
-    # فحص صامت في الخلفية
+    # فحص صامت وفوري في الخلفية
     ok, missing = await check_user_subscription(context.bot, user.id)
     if not ok:
         keyboard = []
@@ -245,13 +223,6 @@ async def gatekeeper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool
         return False
         
     return True
-
-# صائد معرف المجموعة التلقائي (Auto Group ID Grabber)
-async def auto_track_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if chat and chat.type in ["group", "supergroup"]:
-        db_set_setting("tracked_group_id", str(chat.id))
-        logger.info(f"🎯 تم اكتشاف وحفظ معرف المجموعة تلقائياً بنجاح: {chat.id}")
 
 # ============ قائمة اللغات الـ 26 كاملة ============
 NATIVE_LANG_NAMES = {
@@ -1293,7 +1264,7 @@ async def on_startup(app):
     init_fast_json()
     init_creative_json()
     asyncio.create_task(background_pruner())
-    print("🚀 البوت متصل مع نظام التحقق الصارم الصامت وصائد معرف المجموعة التلقائي!")
+    print("🚀 البوت متصل مع نظام التحقق الصارم الثابت بالمعرف الدائم!")
 
 def main():
     app = (
@@ -1303,9 +1274,6 @@ def main():
         .post_init(on_startup)
         .build()
     )
-
-    # معالج كشف المجموعة تلقائياً عند إضافة البوت أو إرسال رسالة فيها
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS, auto_track_group), group=1)
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
