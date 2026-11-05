@@ -19,7 +19,7 @@ from telegram import (
 )
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ContextTypes, ConversationHandler, filters
+    MessageHandler, ContextTypes, ConversationHandler, ChatMemberHandler, filters
 )
 
 # ============ مكتبات اختيارية ============
@@ -46,14 +46,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============ إعدادات البيئة ============
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "ضع_التوكن_هنا")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "ضع_توكن_البوت_هنا")
 
-# قنوات الاشتراك الإجباري
-REQUIRED_CHANNELS = [
-    {"name": "قناة الشروحات التقنية", "id": "@Basira_Tech", "link": "https://t.me/Basira_Tech"},
-    {"name": "قناة مشاريع المطور", "id": "@AhmedHassanProjects", "link": "https://t.me/AhmedHassanProjects"},
-    {"name": "مجموعة النقاش والتعليقات", "id": os.environ.get("GROUP_CHAT_ID", "@Basira_Tech"), "link": "https://t.me/+6e6e1QVB4z8xMGE0"}
+# قنوات ومجموعة الاشتراك الإجباري
+CHANNELS_TO_CHECK = [
+    {"name": "قناة الشروحات التقنية 💡", "id": "@Basira_Tech", "link": "https://t.me/Basira_Tech"},
+    {"name": "قناة مشاريع المطور 👨‍💻", "id": "@AhmedHassanProjects", "link": "https://t.me/AhmedHassanProjects"},
 ]
+GROUP_INVITE_LINK = "https://t.me/+6e6e1QVB4z8xMGE0"
 
 DB_FILE = "bot_database.db"
 USER_ASSETS_DIR = "user_audio_assets"
@@ -93,7 +93,7 @@ DEFAULT_CONFIG = {
     "user_fx": {}
 }
 
-# ============ قاعدة بيانات SQLite الذاتية ============
+# ============ إدارة قاعدة بيانات SQLite ============
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
@@ -104,8 +104,29 @@ def init_db():
             last_active TIMESTAMP
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS bot_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
     conn.commit()
     conn.close()
+
+def db_set_setting(key: str, value: str):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("INSERT OR REPLACE INTO bot_settings (key, value) VALUES (?, ?)", (key, str(value)))
+    conn.commit()
+    conn.close()
+
+def db_get_setting(key: str, default=None):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM bot_settings WHERE key = ?", (key,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else default
 
 def db_touch_user(user_id: str, config: dict = None):
     conn = sqlite3.connect(DB_FILE)
@@ -154,49 +175,85 @@ def db_prune_inactive(days: int = 10):
         conn.commit()
         conn.close()
         if expired:
-            logger.info(f"🧹 تم حذف إعدادات ومخلفات {len(expired)} حسابات خاملة منذ 10 أيام.")
+            logger.info(f"🧹 تم حذف إعدادات {len(expired)} حسابات خاملة.")
     except Exception as e:
         logger.error(f"خطأ تنظيف الحسابات: {e}")
 
-# ============ فحص الاشتراك الصارم ============
+# ============ فحص الاشتراك الصارم والدقيق ============
 async def check_user_subscription(bot, user_id: int) -> tuple[bool, list]:
     missing = []
-    for ch in REQUIRED_CHANNELS:
+    
+    # 1. فحص القنوات الرسمية
+    for ch in CHANNELS_TO_CHECK:
         try:
             member = await bot.get_chat_member(chat_id=ch["id"], user_id=user_id)
-            if member.status not in [ChatMember.MEMBER, ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
+            if member.status in [ChatMember.LEFT, ChatMember.BANNED]:
+                missing.append(ch)
+            elif member.status not in [ChatMember.MEMBER, ChatMember.ADMINISTRATOR, ChatMember.OWNER, ChatMember.RESTRICTED]:
                 missing.append(ch)
         except Exception as e:
-            logger.warning(f"تعذر فحص {ch['id']}: {e}")
+            logger.error(f"⚠️ تنبيه التحقق: تعذر فحص القناة {ch['id']}: {e}")
+            logger.error("👉 تأكد من إضافة البوت كمشرف (Admin) داخل القناة لتسمح له تليجرام بفحص المشتركين!")
+            # إذا تعذر الفحص بسبب أن المستخدم ليس بالقناة فعلاً
+            missing.append(ch)
+
+    # 2. فحص المجموعة الرسمية
+    group_id = db_get_setting("tracked_group_id", os.environ.get("GROUP_CHAT_ID"))
+    if group_id:
+        try:
+            g_member = await bot.get_chat_member(chat_id=int(group_id) if str(group_id).lstrip('-').isdigit() else group_id, user_id=user_id)
+            if g_member.status in [ChatMember.LEFT, ChatMember.BANNED]:
+                missing.append({"name": "مجموعة النقاش والتعليقات 💬", "link": GROUP_INVITE_LINK})
+        except Exception as e:
+            logger.warning(f"تعذر فحص المجموعة {group_id}: {e}")
+            missing.append({"name": "مجموعة النقاش والتعليقات 💬", "link": GROUP_INVITE_LINK})
+    else:
+        # إذا لم يُسجل معرف المجموعة بعد، نطلب منه الانضمام عبر الرابط
+        missing.append({"name": "مجموعة النقاش والتعليقات 💬", "link": GROUP_INVITE_LINK})
+
     return (len(missing) == 0, missing)
 
 async def gatekeeper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
     if not user:
         return False
+        
     db_touch_user(str(user.id))
+    
+    # فحص صامت في الخلفية
     ok, missing = await check_user_subscription(context.bot, user.id)
     if not ok:
         keyboard = []
-        for ch in missing:
-            keyboard.append([InlineKeyboardButton(f"📢 اشترك في: {ch['name']}", url=ch["link"])])
-        keyboard.append([InlineKeyboardButton("🔄 تحقق من الاشتراك الآن", callback_data="btn_recheck_sub")])
-        msg_text = (
-            f"⚠️ **مرحباً يا {user.first_name}!**\n\n"
-            f"لاستخدام البوت مجاناً بدون انقطاع، يجب عليك الاشتراك في القنوات والمجموعة الرسمية للمطور:\n\n"
-            f"👇 اشترك من الأزرار بالأسفل ثم اضغط زر التحقق:"
+        for item in missing:
+            keyboard.append([InlineKeyboardButton(f"✨ انضم إلى: {item['name']}", url=item["link"])])
+        
+        keyboard.append([InlineKeyboardButton("🔄 تم الاشتراك، تفعيل البوت الآن ✅", callback_data="btn_recheck_sub")])
+        
+        nice_msg = (
+            f"أهلاً بك يا مبدع **{user.first_name}** في استوديو الصوت الذكي! 🎙️🌸\n\n"
+            f"يسعدنا جداً انضمامك إلينا! لكي نتمكن من إتاحة كافة خوادم توليد الصوت والسيناريو لك **مجاناً وبدون أي قيود**، نرجو منك التكرم بالانضمام إلى عائلتنا وقنواتنا الرسمية أدناه:\n\n"
+            f"👇 **انضم عبر الأزرار، ثم اضغط على زر التفعيل لتنطلق فوراً:**"
         )
+        
         if update.callback_query:
             try:
-                await update.callback_query.message.edit_text(msg_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+                await update.callback_query.message.edit_text(nice_msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
             except Exception:
-                await update.callback_query.message.reply_text(msg_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+                await update.callback_query.message.reply_text(nice_msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         elif update.message:
-            await update.message.reply_text(msg_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+            await update.message.reply_text(nice_msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return False
+        
     return True
 
-# ============ قائمة اللغات الـ 26 كاملة دون أي نقص ============
+# صائد معرف المجموعة التلقائي (Auto Group ID Grabber)
+async def auto_track_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat and chat.type in ["group", "supergroup"]:
+        db_set_setting("tracked_group_id", str(chat.id))
+        logger.info(f"🎯 تم اكتشاف وحفظ معرف المجموعة تلقائياً بنجاح: {chat.id}")
+
+# ============ قائمة اللغات الـ 26 كاملة ============
 NATIVE_LANG_NAMES = {
     "ar": "العربية", "en": "English", "tr": "Türkçe", "es": "Español",
     "fr": "Français", "de": "Deutsch", "it": "Italiano", "pt": "Português",
@@ -247,7 +304,6 @@ def init_fast_json():
         json.dump(db, f, ensure_ascii=False, indent=2)
     DB_FAST = db
 
-# استرجاع جميع لغات وأصوات تيك توك كاملة 100%
 def init_creative_json():
     global DB_CREATIVE
     if os.path.exists(FILE_CREATIVE_JSON):
@@ -285,7 +341,7 @@ def init_creative_json():
         json.dump(db, f, ensure_ascii=False, indent=2)
     DB_CREATIVE = db
 
-# ============ FFmpeg والصوت ============
+# ============ دوال FFmpeg ============
 async def run_ffmpeg(args: list, timeout: int = 240) -> bool:
     if not shutil.which("ffmpeg"):
         return False
@@ -329,7 +385,6 @@ async def normalize_to_mp3(input_file: str, output_file: str) -> bool:
         "-c:a", "libmp3lame", "-q:a", "2", "-y", output_file
     ])
 
-# دمج الموسيقى الخلفية تحت مقطع الكلام (Background Audio Overlay)
 async def overlay_bgm_on_speech(speech_file: str, bgm_file: str, output_file: str, bgm_vol: float = 0.18) -> bool:
     if not os.path.exists(bgm_file):
         shutil.copy(speech_file, output_file)
@@ -342,7 +397,7 @@ async def overlay_bgm_on_speech(speech_file: str, bgm_file: str, output_file: st
         "-map", "[out]", "-c:a", "libmp3lame", "-q:a", "2", "-y", output_file
     ])
 
-# ============ توليد TTS الفردي ============
+# ============ توليد أصوات TTS ============
 async def synthesize_chunk(text: str, engine: str, voice: str, out_file: str,
                            speed: float = 1.0, pitch: str = "normal", volume: float = 1.0) -> bool:
     clean_text = text.strip()
@@ -368,7 +423,6 @@ async def synthesize_chunk(text: str, engine: str, voice: str, out_file: str,
                 os.replace(tmp, out_file)
         return True
     else:
-        # محرك TikTok الأصلي
         global GLOBAL_HTTP_SESSION
         if GLOBAL_HTTP_SESSION is None or GLOBAL_HTTP_SESSION.closed:
             GLOBAL_HTTP_SESSION = aiohttp.ClientSession()
@@ -381,17 +435,8 @@ async def synthesize_chunk(text: str, engine: str, voice: str, out_file: str,
                 return True
         return False
 
-# ============ محلل نصوص السيناريو الصارم (تصليح m و f و mf و s و v) ============
+# ============ محلل نصوص السيناريو والمؤثرات ============
 def parse_strict_script(script_text: str, mode: str, max_voices: int = 1):
-    """
-    يتعرف حصرياً وبدقة على ما بداخل الأقواس:
-    (v1..5)
-    (s2) أو (s12.5)
-    (mf1..5)
-    (m1..5)
-    (f1..5) أو (f)
-    ولا يلمس أي نص حوار عادي نهائياً!
-    """
     pattern = re.compile(r'(\(\s*(?:v[1-5]|s\d+(?:\.\d+)?|mf[1-5]|m[1-5]|f[1-5]|f)\s*\))', re.IGNORECASE)
     parts = pattern.split(script_text)
 
@@ -407,12 +452,10 @@ def parse_strict_script(script_text: str, mode: str, max_voices: int = 1):
         if m_tag:
             tag_content = m_tag.group(1).lower()
 
-            # وسم تبديل الشخصية
             if tag_content.startswith('v') and tag_content[1:].isdigit():
                 cur_voice = min(int(tag_content[1:]) - 1, max_voices - 1)
                 continue
 
-            # وسم الصمت
             if tag_content.startswith('s'):
                 try:
                     dur = float(tag_content[1:])
@@ -421,7 +464,6 @@ def parse_strict_script(script_text: str, mode: str, max_voices: int = 1):
                 except ValueError:
                     pass
 
-            # وسوم المؤثرات للسيناريو والمتعدد
             if mode in ["story", "multilang"]:
                 if tag_content.startswith('mf') and tag_content[2:].isdigit():
                     sequence.append({"type": "mf_sound", "fx_id": tag_content[2:]})
@@ -434,12 +476,10 @@ def parse_strict_script(script_text: str, mode: str, max_voices: int = 1):
                     sequence.append({"type": "m_bgm_stop", "fx_id": fx_id})
                     continue
 
-        # نص عادي يُنطق بصوت الشخصية الحالية
         sequence.append({"type": "speech", "voice_idx": cur_voice, "text": token})
 
     return sequence
 
-# ============ تجزئة النصوص ============
 def _sync_split_text_semantically(text: str, max_chars: int = 1000) -> list:
     clean = text.strip()
     if not clean: return []
@@ -463,10 +503,11 @@ def _sync_split_text_semantically(text: str, max_chars: int = 1000) -> list:
 async def split_text_semantically(text: str, max_chars: int = 1000) -> list:
     return await asyncio.to_thread(_sync_split_text_semantically, text, max_chars)
 
-# ============ تدفق واجهات المستخدم (UI Menus) ============
+# ============ واجهات وأزرار التحكم ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await gatekeeper(update, context):
         return ConversationHandler.END
+        
     user_id = str(update.effective_user.id)
     saved = db_get_config(user_id)
     context.user_data.update(saved)
@@ -695,7 +736,7 @@ async def on_voice_selected(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         context.user_data["voice_name"] = voice_name
         return await ask_speed_single(update, context)
 
-# ============ شاشة طاقم العمل والمؤثرات (Story & Multi-lang) ============
+# ============ شاشة طاقم العمل والمؤثرات ============
 async def show_story_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     slots = context.user_data.get("story_slots", [])
     user_fx = context.user_data.get("user_fx", {})
@@ -711,7 +752,7 @@ async def show_story_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         text += "  *(لم يتم رفع أي مؤثرات صوتية - اختياري)*\n"
     else:
         for fx_id in sorted(user_fx.keys(), key=lambda x: int(x)):
-            text += f"  • `(m{fx_id})` لبدء الموسيقى / `(mf{fx_id})` لفاصل مستقل: مؤثر {fx_id} ✅\n"
+            text += f"  • `(m{fx_id})` لبدء الموسيقى / `(mf{fx_id})` لفاصل: مؤثر {fx_id} ✅\n"
 
     buttons = []
     if len(slots) < 5:
@@ -765,7 +806,6 @@ async def show_multilang_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
     return STEP_MULTILANG_MENU
 
-# ============ أزرار إدارة الطاقم والمؤثرات ============
 async def handle_story_menu_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -808,7 +848,6 @@ async def handle_story_menu_callbacks(update: Update, context: ContextTypes.DEFA
 
     return STEP_STORY_MENU
 
-# ============ استقبال ملف المؤثر الصوتي ============
 async def receive_fx_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await gatekeeper(update, context):
         return STEP_TEXT
@@ -844,7 +883,6 @@ async def receive_fx_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     else:
         return await show_multilang_menu(update, context)
 
-# ============ تخصيص نبرة وسرعة صوت محدد ============
 async def handle_voice_tuning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -897,7 +935,6 @@ async def render_voice_tuning_card(update: Update, context: ContextTypes.DEFAULT
     await query.edit_message_text(title, reply_markup=InlineKeyboardMarkup([spd_row, pit_row, back_row]), parse_mode="Markdown")
     return STEP_VOICE_CUSTOMIZE
 
-# ============ ضبط السرعة للمحركات الفردية ============
 async def ask_speed_single(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     spd = context.user_data.get("speed", 1.0)
@@ -967,7 +1004,6 @@ async def preview_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         logger.error(f"Preview error: {e}")
     return STEP_SPEED
 
-# ============ الصيغ والانتهاء ============
 async def ask_format(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     formats = [
         [InlineKeyboardButton("MP3 (شامل التوافقية - خفيف)", callback_data="fmt_mp3")],
@@ -1004,7 +1040,7 @@ async def select_format(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     await query.edit_message_text(f"{info}\n\n📁 الصيغة المحددة: `({chosen.upper()})`", parse_mode="Markdown")
     return STEP_TEXT
 
-# ============ التنفيذ والدمج الحي للموسيقى الخلفية (BGM Mixer) ============
+# ============ التنفيذ والدمج الحي ============
 def get_user_queue(user_id: int) -> asyncio.Queue:
     if user_id not in USER_TASK_QUEUES:
         USER_TASK_QUEUES[user_id] = asyncio.Queue()
@@ -1051,7 +1087,6 @@ async def execute_generation(update: Update, context: ContextTypes.DEFAULT_TYPE,
         try:
             await _do_generate(update, context, user_text, status_msg)
         finally:
-            # تنظيف فوري لجميع المؤثرات والملفات المؤقتة للمستخدم
             udir = os.path.join(USER_ASSETS_DIR, str(user_id))
             if os.path.exists(udir):
                 shutil.rmtree(udir, ignore_errors=True)
@@ -1064,7 +1099,7 @@ async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
 
     with tempfile.TemporaryDirectory() as tmpdir:
         chunks = []
-        active_bgm_file = None  # المسار الحالي للموسيقى الخلفية النشطة أثناء الحوار
+        active_bgm_file = None
 
         if mode == "story":
             slots = context.user_data.get("story_slots", [])
@@ -1075,29 +1110,20 @@ async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
             for idx, item in enumerate(sequence):
                 cf = os.path.join(tmpdir, f"st_{idx}.mp3")
 
-                # 1. بدء الموسيقى الخلفية
                 if item["type"] == "m_bgm_start":
                     active_bgm_file = user_fx.get(str(item["fx_id"]))
                     continue
-
-                # 2. إيقاف الموسيقى الخلفية
                 elif item["type"] == "m_bgm_stop":
                     active_bgm_file = None
                     continue
-
-                # 3. الصمت
                 elif item["type"] == "silence":
                     if await create_silence(item["duration"], cf):
                         chunks.append(cf)
-
-                # 4. مقطع مستقل (ينتهي بالكامل ثم يستأنف الكلام)
                 elif item["type"] == "mf_sound":
                     fx_path = user_fx.get(str(item["fx_id"]))
                     if fx_path and os.path.exists(fx_path):
                         if await normalize_to_mp3(fx_path, cf):
                             chunks.append(cf)
-
-                # 5. الحوار والكلام
                 elif item["type"] == "speech":
                     slot = slots[item["voice_idx"]]
                     pieces = await split_text_semantically(item["text"])
@@ -1105,7 +1131,6 @@ async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
                         sub_raw = os.path.join(tmpdir, f"raw_{idx}_{j}.mp3")
                         sub_final = os.path.join(tmpdir, f"sp_{idx}_{j}.mp3")
                         if await synthesize_chunk(p, slot["engine"], slot["voice"], sub_raw, speed=slot.get("speed", 1.0), pitch=slot.get("pitch", "normal")):
-                            # إن كانت هناك موسيقى مرافقة مفعّلة بـ (m)، يتم دمجها تحت الحوار
                             if active_bgm_file and os.path.exists(active_bgm_file):
                                 await overlay_bgm_on_speech(sub_raw, active_bgm_file, sub_final, bgm_vol=0.18)
                             else:
@@ -1142,7 +1167,6 @@ async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
                                 shutil.copy(sub_raw, sub_final)
                             chunks.append(sub_final)
         else:
-            # نمط الصوت الفردي
             engine = context.user_data.get("engine", "neural")
             voice = context.user_data.get("voice", "ar-EG-SalmaNeural")
             spd = context.user_data.get("speed", 1.0)
@@ -1162,7 +1186,6 @@ async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
         if not chunks:
             raise Exception("لم يتم توليد أي صوت.")
 
-        # دمج المقاطع الناتجة
         list_file = os.path.join(tmpdir, "concat.txt")
         with open(list_file, "w", encoding="utf-8") as f:
             for c in chunks:
@@ -1242,12 +1265,15 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    
+    # فحص زر إعادة التحقق
     if query.data == "btn_recheck_sub":
         ok, _ = await check_user_subscription(context.bot, update.effective_user.id)
         if ok:
-            await query.edit_message_text("✅ شكراً لاشتراكك! البوت مفعل. أرسل /start الآن.")
+            await query.edit_message_text("🎉 **أهلاً بك معنا! تم التحقق من اشتراكك بنجاح.**\nأرسل /start أو أرسل نصك/ملفك الصوتي الآن لتبدأ!", parse_mode="Markdown")
         else:
             await gatekeeper(update, context)
+            
     elif query.data == "cfg_restart":
         return await start(update, context)
 
@@ -1267,7 +1293,7 @@ async def on_startup(app):
     init_fast_json()
     init_creative_json()
     asyncio.create_task(background_pruner())
-    print("🚀 البوت المتكامل جاهز ومحمي بالكامل مع دعم الموسيقى المرافقة والـ 26 لغة كاملة!")
+    print("🚀 البوت متصل مع نظام التحقق الصارم الصامت وصائد معرف المجموعة التلقائي!")
 
 def main():
     app = (
@@ -1277,6 +1303,9 @@ def main():
         .post_init(on_startup)
         .build()
     )
+
+    # معالج كشف المجموعة تلقائياً عند إضافة البوت أو إرسال رسالة فيها
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS, auto_track_group), group=1)
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -1311,6 +1340,8 @@ def main():
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CallbackQueryHandler(handle_callbacks, pattern="^(btn_recheck_sub|cfg_restart)"))
     app.add_handler(conv_handler)
+    
+    # معالجات الرسائل المباشرة مع الحراسة الصامتة
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, generate_audio))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
