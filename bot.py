@@ -45,16 +45,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ============ إعدادات البيئة والاشتراك الإجباري الثابت ============
+# ============ إعدادات البيئة والتوكنات ============
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "ضع_توكن_البوت_هنا")
+ADM_TOKEN = os.environ.get("ADM", "").strip()  # توكن جيت هب المخزن في Secrets
+BACKUP_REPO_NAME = "data"
 
-# قنوات الاشتراك الإجباري الرسمية
 CHANNELS_TO_CHECK = [
     {"name": "قناة الشروحات التقنية 💡", "id": "@Basira_Tech", "link": "https://t.me/Basira_Tech"},
     {"name": "قناة مشاريع المطور 👨‍💻", "id": "@AhmedHassanProjects", "link": "https://t.me/AhmedHassanProjects"},
 ]
 
-# المعرف الرقمي الثابت لمجموعة النقاش ورابطها
 GROUP_CHAT_ID = -1003997349654
 GROUP_INVITE_LINK = "https://t.me/+6e6e1QVB4z8xMGE0"
 
@@ -67,13 +67,10 @@ FILE_FAST_JSON = "fast_voices.json"
 FILE_CREATIVE_JSON = "creative_voices.json"
 
 MAX_TEXT_LEN = 30000
-MAX_CONCURRENT_TTS = 3
+MAX_PARALLEL_RENDERS = 2
 GLOBAL_TTS_SEMAPHORE = None
+GLOBAL_TASK_QUEUE = None
 GLOBAL_HTTP_SESSION = None
-
-USER_TASK_QUEUES = {}
-USER_CURRENT_TASK = {}
-USER_WORKERS = {}
 
 (
     STEP_ENGINE, STEP_LANG, STEP_DIALECT, STEP_VOICE,
@@ -95,6 +92,115 @@ DEFAULT_CONFIG = {
     "multilang_slots": [],
     "user_fx": {}
 }
+
+# ============ نظام النسخ الاحتياطي لمستودع data عبر توكن ADM ============
+async def github_api_request(method: str, endpoint: str, payload: dict = None) -> dict:
+    if not ADM_TOKEN:
+        return None
+    url = f"https://api.github.com/{endpoint.lstrip('/')}"
+    headers = {
+        "Authorization": f"Bearer {ADM_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.request(method, url, headers=headers, json=payload) as resp:
+                if resp.status in [200, 201]:
+                    return await resp.json()
+                elif resp.status == 404:
+                    return {"status": 404}
+                else:
+                    err_txt = await resp.text()
+                    logger.warning(f"GitHub API [{method} {endpoint}] Error ({resp.status}): {err_txt}")
+                    return None
+        except Exception as e:
+            logger.error(f"GitHub connection error: {e}")
+            return None
+
+async def github_get_authenticated_user() -> str:
+    res = await github_api_request("GET", "user")
+    if res and "login" in res:
+        return res["login"]
+    return None
+
+async def github_ensure_repo_exists(owner: str):
+    res = await github_api_request("GET", f"repos/{owner}/{BACKUP_REPO_NAME}")
+    if res and res.get("status") == 404:
+        logger.info(f"📁 المستودع {BACKUP_REPO_NAME} غير موجود، جاري إنشاؤه تلقائياً...")
+        await github_api_request("POST", "user/repos", {
+            "name": BACKUP_REPO_NAME,
+            "private": True,
+            "description": "Auto backup storage for Telegram TTS Bot"
+        })
+
+async def github_restore_latest_db():
+    if not ADM_TOKEN:
+        logger.warning("⚠️ لم يتم تعيين توكن ADM، سيعمل البوت بالتخزين المحلي المؤقت.")
+        return
+
+    owner = await github_get_authenticated_user()
+    if not owner:
+        logger.error("❌ فشل التحقق من توكن ADM الخاص بجيت هب.")
+        return
+
+    await github_ensure_repo_exists(owner)
+    contents = await github_api_request("GET", f"repos/{owner}/{BACKUP_REPO_NAME}/contents/")
+    
+    if isinstance(contents, list):
+        db_files = [f for f in contents if f.get("name", "").startswith("backup_") and f.get("name", "").endswith(".db")]
+        if db_files:
+            db_files.sort(key=lambda x: x["name"])
+            latest = db_files[-1]
+            download_url = latest.get("download_url")
+            logger.info(f"📥 جاري استرجاع أحدث ملف بيانات: {latest['name']}...")
+            async with aiohttp.ClientSession() as session:
+                async with session.get(download_url) as resp:
+                    if resp.status == 200:
+                        data = await resp.read()
+                        with open(DB_FILE, "wb") as f:
+                            f.write(data)
+                        logger.info("✅ تم بنجاح استرجاع وتثبيت أحدث نسخة من البيانات!")
+                        return
+    logger.info("ℹ️ لم يتم العثور على نسخ سابقة، سيتم إنشاء قاعدة بيانات جديدة والبدء من الصفر.")
+
+async def github_upload_backup():
+    if not ADM_TOKEN or not os.path.exists(DB_FILE):
+        return
+
+    owner = await github_get_authenticated_user()
+    if not owner:
+        return
+
+    await github_ensure_repo_exists(owner)
+    
+    # تنظيف الخاملين قبل رفع النسخة
+    db_prune_inactive(days=10)
+
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    file_name = f"backup_{timestamp}.db"
+    
+    with open(DB_FILE, "rb") as f:
+        file_bytes = f.read()
+    b64_content = base64.b64encode(file_bytes).decode("utf-8")
+
+    payload = {
+        "message": f"Auto-backup at {timestamp} [skip ci]",
+        "content": b64_content
+    }
+    
+    res = await github_api_request("PUT", f"repos/{owner}/{BACKUP_REPO_NAME}/contents/{file_name}", payload)
+    if res:
+        logger.info(f"💾 تم رفع نسخة احتياطية جديدة بنجاح إلى مستودع {BACKUP_REPO_NAME}: {file_name}")
+
+# مهمة النسخ الاحتياطي التلقائي الدوري كل 7 دقائق
+async def periodic_backup_task():
+    while True:
+        await asyncio.sleep(420)  # 7 دقائق = 420 ثانية
+        try:
+            await github_upload_backup()
+        except Exception as e:
+            logger.error(f"خطأ أثناء مهمة النسخ الاحتياطي الدوري: {e}")
 
 # ============ إدارة قاعدة بيانات SQLite ============
 def init_db():
@@ -157,15 +263,15 @@ def db_prune_inactive(days: int = 10):
         conn.commit()
         conn.close()
         if expired:
-            logger.info(f"🧹 تم حذف إعدادات {len(expired)} حسابات خاملة.")
+            logger.info(f"🧹 تم حذف إعدادات ومخلفات {len(expired)} حسابات خاملة منذ 10 أيام.")
     except Exception as e:
         logger.error(f"خطأ تنظيف الحسابات: {e}")
 
-# ============ فحص الاشتراك الصارم والمغلق ============
+# ============ فحص الاشتراك الصارم ============
 async def check_user_subscription(bot, user_id: int) -> tuple[bool, list]:
     missing = []
     
-    # 1. فحص القنوات الرسمية
+    # 1. فحص القنوات
     for ch in CHANNELS_TO_CHECK:
         try:
             member = await bot.get_chat_member(chat_id=ch["id"], user_id=user_id)
@@ -174,10 +280,10 @@ async def check_user_subscription(bot, user_id: int) -> tuple[bool, list]:
             elif member.status not in [ChatMember.MEMBER, ChatMember.ADMINISTRATOR, ChatMember.OWNER, ChatMember.RESTRICTED]:
                 missing.append(ch)
         except Exception as e:
-            logger.error(f"⚠️ تنبيه التحقق: تعذر فحص القناة {ch['id']}: {e}")
+            logger.error(f"⚠️ تعذر فحص القناة {ch['id']}: {e}")
             missing.append(ch)
 
-    # 2. فحص المجموعة الرسمية بالمعرف الثابت
+    # 2. فحص المجموعة بالمعرف الثابت
     try:
         g_member = await bot.get_chat_member(chat_id=GROUP_CHAT_ID, user_id=user_id)
         if g_member.status in [ChatMember.LEFT, ChatMember.BANNED]:
@@ -185,8 +291,7 @@ async def check_user_subscription(bot, user_id: int) -> tuple[bool, list]:
         elif g_member.status not in [ChatMember.MEMBER, ChatMember.ADMINISTRATOR, ChatMember.OWNER, ChatMember.RESTRICTED]:
             missing.append({"name": "مجموعة النقاش والتعليقات 💬", "link": GROUP_INVITE_LINK})
     except Exception as e:
-        logger.error(f"⚠️ تنبيه التحقق: تعذر فحص المجموعة {GROUP_CHAT_ID}: {e}")
-        # شرط صارم: إذا لم نتمكن من التحقق من وجوده في المجموعة يُمنع من الدخول
+        logger.error(f"⚠️ تعذر فحص المجموعة {GROUP_CHAT_ID}: {e}")
         missing.append({"name": "مجموعة النقاش والتعليقات 💬", "link": GROUP_INVITE_LINK})
 
     return (len(missing) == 0, missing)
@@ -198,7 +303,6 @@ async def gatekeeper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool
         
     db_touch_user(str(user.id))
     
-    # فحص صامت وفوري في الخلفية
     ok, missing = await check_user_subscription(context.bot, user.id)
     if not ok:
         keyboard = []
@@ -209,7 +313,7 @@ async def gatekeeper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool
         
         nice_msg = (
             f"أهلاً بك يا مبدع **{user.first_name}** في استوديو الصوت الذكي! 🎙️🌸\n\n"
-            f"يسعدنا جداً انضمامك إلينا! لكي نتمكن من إتاحة كافة خوادم توليد الصوت والسيناريو لك **مجاناً وبدون أي قيود**، نرجو منك التكرم بالانضمام إلى عائلتنا وقنواتنا الرسمية أدناه:\n\n"
+            f"يسعدنا جداً انضمامك إلينا! لكي نتمكن من إتاحة كافة خوادم توليد الصوت والسيناريو لك **مجاناً وبدون أي قيود**، نرجو منك التكرم بالانضمام إلى قنواتنا الرسمية ومجموعتنا أدناه:\n\n"
             f"👇 **انضم عبر الأزرار، ثم اضغط على زر التفعيل لتنطلق فوراً:**"
         )
         
@@ -224,7 +328,7 @@ async def gatekeeper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool
         
     return True
 
-# ============ قائمة اللغات الـ 26 كاملة ============
+# ============ اللغات والأصوات ============
 NATIVE_LANG_NAMES = {
     "ar": "العربية", "en": "English", "tr": "Türkçe", "es": "Español",
     "fr": "Français", "de": "Deutsch", "it": "Italiano", "pt": "Português",
@@ -312,7 +416,7 @@ def init_creative_json():
         json.dump(db, f, ensure_ascii=False, indent=2)
     DB_CREATIVE = db
 
-# ============ دوال FFmpeg ============
+# ============ FFmpeg والصوت ============
 async def run_ffmpeg(args: list, timeout: int = 240) -> bool:
     if not shutil.which("ffmpeg"):
         return False
@@ -474,7 +578,7 @@ def _sync_split_text_semantically(text: str, max_chars: int = 1000) -> list:
 async def split_text_semantically(text: str, max_chars: int = 1000) -> list:
     return await asyncio.to_thread(_sync_split_text_semantically, text, max_chars)
 
-# ============ واجهات وأزرار التحكم ============
+# ============ واجهات وأزرار التحكم السريعة ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await gatekeeper(update, context):
         return ConversationHandler.END
@@ -1011,57 +1115,52 @@ async def select_format(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     await query.edit_message_text(f"{info}\n\n📁 الصيغة المحددة: `({chosen.upper()})`", parse_mode="Markdown")
     return STEP_TEXT
 
-# ============ التنفيذ والدمج الحي ============
-def get_user_queue(user_id: int) -> asyncio.Queue:
-    if user_id not in USER_TASK_QUEUES:
-        USER_TASK_QUEUES[user_id] = asyncio.Queue()
-    return USER_TASK_QUEUES[user_id]
+# ============ طابور المعالجة الهادئ بدون مصطلحات الطابور ============
+def get_global_queue():
+    global GLOBAL_TASK_QUEUE
+    if GLOBAL_TASK_QUEUE is None:
+        GLOBAL_TASK_QUEUE = asyncio.Queue()
+    return GLOBAL_TASK_QUEUE
 
 def get_tts_semaphore():
     global GLOBAL_TTS_SEMAPHORE
     if GLOBAL_TTS_SEMAPHORE is None:
-        GLOBAL_TTS_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TTS)
+        GLOBAL_TTS_SEMAPHORE = asyncio.Semaphore(MAX_PARALLEL_RENDERS)
     return GLOBAL_TTS_SEMAPHORE
 
-async def user_queue_worker(user_id: int):
-    q = get_user_queue(user_id)
-    while True:
-        task_data = await q.get()
-        if task_data is None: break
-        update, context, text = task_data
-        try:
-            await execute_generation(update, context, text)
-        except Exception as e:
-            logger.error(f"Task error: {e}", exc_info=True)
-            try: await update.message.reply_text("⚠️ حدث خطأ أثناء المعالجة.")
-            except Exception: pass
-        finally:
-            q.task_done()
-
-def ensure_user_worker(user_id: int):
-    worker = USER_WORKERS.get(user_id)
-    if worker is None or worker.done():
-        USER_WORKERS[user_id] = asyncio.create_task(user_queue_worker(user_id))
-
-async def enqueue_task(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    user_id = update.effective_user.id
-    ensure_user_worker(user_id)
-    q = get_user_queue(user_id)
-    await q.put((update, context, text))
-
-async def execute_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str):
-    user_id = update.effective_user.id
+async def global_queue_worker():
+    q = get_global_queue()
     sem = get_tts_semaphore()
-    status_msg = await update.message.reply_text("⏳ **جاري معالجة وهندسة الصوت بالاستوديو...**", parse_mode="Markdown")
+    while True:
+        update, context, text, status_msg = await q.get()
+        asyncio.create_task(process_queued_task(sem, update, context, text, status_msg, q))
 
+async def process_queued_task(sem, update, context, text, status_msg, q):
     async with sem:
         try:
-            await _do_generate(update, context, user_text, status_msg)
+            await status_msg.edit_text("⏳ **بدأت معالجة وهندسة المقطع الصوتي الآن بأعلى جودة...**", parse_mode="Markdown")
+            await _do_generate(update, context, text, status_msg)
+        except Exception as e:
+            logger.error(f"Render error: {e}", exc_info=True)
+            try: await status_msg.edit_text("⚠️ حدث خطأ أثناء التوليد، يرجى المحاولة لاحقاً.")
+            except Exception: pass
         finally:
+            user_id = update.effective_user.id
             udir = os.path.join(USER_ASSETS_DIR, str(user_id))
             if os.path.exists(udir):
                 shutil.rmtree(udir, ignore_errors=True)
             context.user_data["user_fx"] = {}
+            q.task_done()
+
+async def enqueue_task(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    q = get_global_queue()
+    # رسالة راقية ومطمئنة بدون أي ذكر لكلمة "طابور" أو "أدوار"
+    status_msg = await update.message.reply_text(
+        "⏳ **جاري استلام طلبك وهندسة الصوت بدقة عالية...**\n"
+        "يرجى الانتظار قليلاً، سوف يستغرق التوليد بضع لحظات وسنرسل لك المقطع الصوتي مباشرة 🌸",
+        parse_mode="Markdown"
+    )
+    await q.put((update, context, text, status_msg))
 
 async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str, status_msg):
     mode = context.user_data.get("mode", "single")
@@ -1218,7 +1317,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         shutil.rmtree(tmpdir, ignore_errors=True)
     return STEP_TEXT
 
-# ============ أوامر الإعدادات والصيانة ============
+# ============ أوامر الإعدادات ============
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await gatekeeper(update, context): return
     cfg = db_get_config(str(update.effective_user.id))
@@ -1237,7 +1336,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    # فحص زر إعادة التحقق
     if query.data == "btn_recheck_sub":
         ok, _ = await check_user_subscription(context.bot, update.effective_user.id)
         if ok:
@@ -1252,6 +1350,7 @@ async def noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: await update.callback_query.answer()
     except Exception: pass
 
+# تنظيف دوري للبيانات الخاملة كل 24 ساعة
 async def background_pruner():
     while True:
         try: db_prune_inactive(days=10)
@@ -1259,18 +1358,22 @@ async def background_pruner():
         await asyncio.sleep(86400)
 
 async def on_startup(app):
+    print("⏳ جاري فحص واسترجاع أحدث نسخة بيانات من مستودع data...")
+    await github_restore_latest_db()
     init_db()
     await init_neural_json()
     init_fast_json()
     init_creative_json()
     asyncio.create_task(background_pruner())
-    print("🚀 البوت متصل مع نظام التحقق الصارم الثابت بالمعرف الدائم!")
+    asyncio.create_task(global_queue_worker())
+    asyncio.create_task(periodic_backup_task())  # تشغيل النسخ الاحتياطي التلقائي كل 7 دقائق
+    print("🚀 البوت متصل بنظام الحفظ التلقائي لمستودع data ونظام المعالجة الهادئ!")
 
 def main():
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .concurrent_updates(16)
+        .concurrent_updates(32)
         .post_init(on_startup)
         .build()
     )
@@ -1309,7 +1412,6 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callbacks, pattern="^(btn_recheck_sub|cfg_restart)"))
     app.add_handler(conv_handler)
     
-    # معالجات الرسائل المباشرة مع الحراسة الصامتة
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, generate_audio))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
