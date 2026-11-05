@@ -2,15 +2,11 @@ name: Run Telegram TTS Bot
 
 on:
   schedule:
-    # إعادة تشغيل البوت تلقائياً كل 5 ساعات لضمان العمل المستمر
-    - cron: '0 */5 * * *'
+    # يعمل بانتظام كل 4 ساعات (00, 04, 08, 12, 16, 20) لضمان تقسيم اليوم بالتساوي بدون أي خلل
+    - cron: '0 */4 * * *'
   push:
     branches: [ main ]
   workflow_dispatch:
-
-permissions:
-  actions: write
-  contents: read
 
 concurrency:
   group: telegram-tts-bot
@@ -19,54 +15,49 @@ concurrency:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 260 # حد أقصى آمن للجلسة (أقل من الـ 6 ساعات المسموحة)
 
     steps:
-      # الخطوة 1: استدعاء ملفات المشروع
+      # الخطوة 1: جلب الكود
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # الخطوة 2: إغلاق أي جلسات سابقة
-      - name: Cancel all other running workflows
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          echo "جاري البحث عن أي عمليات سابقة شغالة لإغلاقها..."
-          for run_id in $(gh run list --repo "$GITHUB_REPOSITORY" --status in_progress --json databaseId -q '.[].databaseId'); do
-            if [ "$run_id" != "$GITHUB_RUN_ID" ]; then
-              echo "إيقاف العملية الشغالة رقم: $run_id"
-              gh run cancel "$run_id" --repo "$GITHUB_REPOSITORY" || true
-            fi
-          done
-          for run_id in $(gh run list --repo "$GITHUB_REPOSITORY" --status queued --json databaseId -q '.[].databaseId'); do
-            if [ "$run_id" != "$GITHUB_RUN_ID" ]; then
-              echo "إيقاف العملية المنتظرة رقم: $run_id"
-              gh run cancel "$run_id" --repo "$GITHUB_REPOSITORY" || true
-            fi
-          done
-          echo "تم تنظيف كل الجلسات القديمة بنجاح!"
-          sleep 3
-
-      # الخطوة 3: تثبيت FFmpeg من مستودعات أوبنتو الرسمية مباشرة وبشكل فائق السرعة
+      # الخطوة 2: تثبيت FFmpeg
       - name: Install FFmpeg
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends ffmpeg
 
-      # الخطوة 4: تثبيت بايثون مع الكاش لتسريع تثبيت المكتبات
+      # الخطوة 3: تثبيت بايثون مع الكاش لتوفير الوقت
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
 
-      # الخطوة 5: تثبيت مكتبات بايثون
+      # الخطوة 4: تثبيت المكتبات
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # الخطوة 6: تشغيل البوت
-      - name: Run Bot
+      # الخطوة 5: تشغيل البوت بنظام الحراسة الذاتية وإعادة التشغيل التلقائي
+      - name: Run Bot with Auto-Restart Loop
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-        run: python bot.py
+        run: |
+          echo "🚀 جاري تشغيل البوت بحماية عدم السقوط..."
+          
+          # يعمل لمدة 3 ساعات و 55 دقيقة متواصلة ثم يسلّم الجلسة التالية بسلاسة
+          # وإذا سقط بايثون لأي سبب يعيد تشغيله فوراً خلال ثانيتين دون إغلاق السيرفر
+          timeout 235m bash -c '
+            while true; do
+              echo "⏳ تشغيل bot.py الآن..."
+              python bot.py
+              EXIT_CODE=$?
+              echo "⚠️ توقف البوت بكود ($EXIT_CODE)! إعادة التشغيل فوراً بعد ثانيتين..."
+              sleep 2
+            done
+          ' || true
+          
+          echo "✅ انتهت دورة الجلسة الحالية بنجاح، جاري التبديل للجلسة التالية..."
