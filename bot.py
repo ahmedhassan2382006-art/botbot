@@ -22,7 +22,7 @@ from telegram.ext import (
     MessageHandler, ContextTypes, ConversationHandler, filters
 )
 
-# ============ استيرادات اختيارية ============
+# ============ مكتبات اختيارية ============
 try:
     from langdetect import detect_langs
     HAS_LANGDETECT = True
@@ -90,10 +90,10 @@ DEFAULT_CONFIG = {
     "volume": 1.0,
     "story_slots": [],
     "multilang_slots": [],
-    "user_fx": {}  # تخزين مسارات المؤثرات: {"1": path, "2": path...}
+    "user_fx": {}
 }
 
-# ============ إدارة قاعدة بيانات SQLite الذاتية ============
+# ============ قاعدة بيانات SQLite الذاتية ============
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
@@ -112,7 +112,6 @@ def db_touch_user(user_id: str, config: dict = None):
     cur = conn.cursor()
     now = datetime.utcnow().isoformat()
     if config:
-        # لا نخزن مسارات الملفات المؤقتة في الـ DB للحفاظ على نظافتها
         clean_cfg = dict(config)
         clean_cfg.pop("user_fx", None)
         cur.execute("""
@@ -155,7 +154,7 @@ def db_prune_inactive(days: int = 10):
         conn.commit()
         conn.close()
         if expired:
-            logger.info(f"🧹 تم حذف إعدادات {len(expired)} حسابات خاملة منذ 10 أيام.")
+            logger.info(f"🧹 تم حذف إعدادات ومخلفات {len(expired)} حسابات خاملة منذ 10 أيام.")
     except Exception as e:
         logger.error(f"خطأ تنظيف الحسابات: {e}")
 
@@ -197,12 +196,15 @@ async def gatekeeper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool
         return False
     return True
 
-# ============ تحضير مكتبات الصوت ============
+# ============ قائمة اللغات الـ 26 كاملة دون أي نقص ============
 NATIVE_LANG_NAMES = {
     "ar": "العربية", "en": "English", "tr": "Türkçe", "es": "Español",
     "fr": "Français", "de": "Deutsch", "it": "Italiano", "pt": "Português",
     "ru": "Русский", "zh": "中文", "ja": "日本語", "ko": "한국어",
-    "hi": "हिन्दी", "ur": "اردو", "fa": "فارسی", "nl": "Nederlands"
+    "hi": "हिन्दी", "ur": "اردو", "fa": "فارسی", "nl": "Nederlands",
+    "pl": "Polski", "sv": "Svenska", "id": "Bahasa Indonesia", "el": "Ελληνικά",
+    "uk": "Українська", "vi": "Tiếng Việt", "th": "ไทย", "ro": "Română",
+    "cs": "Čeština", "hu": "Magyar"
 }
 
 DB_NEURAL, DB_FAST, DB_CREATIVE = {}, {}, {}
@@ -233,12 +235,27 @@ async def init_neural_json():
 
 def init_fast_json():
     global DB_FAST
+    if os.path.exists(FILE_FAST_JSON):
+        try:
+            with open(FILE_FAST_JSON, "r", encoding="utf-8") as f:
+                DB_FAST = json.load(f); return
+        except Exception: pass
     from gtts.lang import tts_langs
-    DB_FAST = {c: {"name": NATIVE_LANG_NAMES.get(c, n), "code": c} for c, n in tts_langs().items()}
+    available = tts_langs()
+    db = {code: {"name": NATIVE_LANG_NAMES.get(code, name), "code": code} for code, name in available.items()}
+    with open(FILE_FAST_JSON, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
+    DB_FAST = db
 
+# استرجاع جميع لغات وأصوات تيك توك كاملة 100%
 def init_creative_json():
     global DB_CREATIVE
-    DB_CREATIVE = {
+    if os.path.exists(FILE_CREATIVE_JSON):
+        try:
+            with open(FILE_CREATIVE_JSON, "r", encoding="utf-8") as f:
+                DB_CREATIVE = json.load(f); return
+        except Exception: pass
+    db = {
         "en": {"name": "English", "voices": [
             {"id": "en_us_001", "name": "Narrator (Female)"},
             {"id": "en_us_006", "name": "Joey (Male)"},
@@ -246,8 +263,27 @@ def init_creative_json():
             {"id": "en_male_narration", "name": "Storyteller (Male)"},
             {"id": "en_male_funny", "name": "Wacky (Male)"},
             {"id": "en_female_emotional", "name": "Peaceful (Female)"},
-        ]}
+        ]},
+        "fr": {"name": "Français", "voices": [
+            {"id": "fr_001", "name": "Voix 1 (Male)"},
+            {"id": "fr_002", "name": "Voix 2 (Male)"},
+        ]},
+        "es": {"name": "Español", "voices": [
+            {"id": "es_001", "name": "Voz 1 (Male)"},
+            {"id": "es_mx_002", "name": "Voz Mexicana (Male)"},
+        ]},
+        "de": {"name": "Deutsch", "voices": [
+            {"id": "de_001", "name": "Stimme 1 (Female)"},
+            {"id": "de_002", "name": "Stimme 2 (Male)"},
+        ]},
+        "ja": {"name": "日本語", "voices": [
+            {"id": "jp_001", "name": "女性 1 (Female)"},
+            {"id": "jp_005", "name": "男性 (Male)"},
+        ]},
     }
+    with open(FILE_CREATIVE_JSON, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
+    DB_CREATIVE = db
 
 # ============ FFmpeg والصوت ============
 async def run_ffmpeg(args: list, timeout: int = 240) -> bool:
@@ -293,6 +329,19 @@ async def normalize_to_mp3(input_file: str, output_file: str) -> bool:
         "-c:a", "libmp3lame", "-q:a", "2", "-y", output_file
     ])
 
+# دمج الموسيقى الخلفية تحت مقطع الكلام (Background Audio Overlay)
+async def overlay_bgm_on_speech(speech_file: str, bgm_file: str, output_file: str, bgm_vol: float = 0.18) -> bool:
+    if not os.path.exists(bgm_file):
+        shutil.copy(speech_file, output_file)
+        return True
+    return await run_ffmpeg([
+        "-i", speech_file,
+        "-stream_loop", "-1", "-i", bgm_file,
+        "-filter_complex",
+        f"[0:a]volume=1.0[s];[1:a]volume={bgm_vol:.2f}[m];[s][m]amix=inputs=2:duration=first:dropout_transition=2[out]",
+        "-map", "[out]", "-c:a", "libmp3lame", "-q:a", "2", "-y", output_file
+    ])
+
 # ============ توليد TTS الفردي ============
 async def synthesize_chunk(text: str, engine: str, voice: str, out_file: str,
                            speed: float = 1.0, pitch: str = "normal", volume: float = 1.0) -> bool:
@@ -319,7 +368,7 @@ async def synthesize_chunk(text: str, engine: str, voice: str, out_file: str,
                 os.replace(tmp, out_file)
         return True
     else:
-        # محرك TikTok كما هو دون أي تغيير
+        # محرك TikTok الأصلي
         global GLOBAL_HTTP_SESSION
         if GLOBAL_HTTP_SESSION is None or GLOBAL_HTTP_SESSION.closed:
             GLOBAL_HTTP_SESSION = aiohttp.ClientSession()
@@ -332,18 +381,18 @@ async def synthesize_chunk(text: str, engine: str, voice: str, out_file: str,
                 return True
         return False
 
-# ============ محلل نصوص السيناريو الصارم والمحمي ============
+# ============ محلل نصوص السيناريو الصارم (تصليح m و f و mf و s و v) ============
 def parse_strict_script(script_text: str, mode: str, max_voices: int = 1):
     """
-    يحلل الوسوم المحصورة فقط داخل الأقواس:
-    (v1) إلى (v5)
-    (s2.5) للصمت
-    (m1) إلى (m5) لبدء مؤثر
-    (mf1) إلى (mf5) لفاصل صوتي كامل
-    (f1) إلى (f5) لإيقاف مؤثر
-    كل ما عدا ذلك هو نص حوار نقي 100%!
+    يتعرف حصرياً وبدقة على ما بداخل الأقواس:
+    (v1..5)
+    (s2) أو (s12.5)
+    (mf1..5)
+    (m1..5)
+    (f1..5) أو (f)
+    ولا يلمس أي نص حوار عادي نهائياً!
     """
-    pattern = re.compile(r'(\(\s*(?:v[1-5]|s\d+(?:\.\d+)?|mf[1-5]|m[1-5]|f[1-5])\s*\))', re.IGNORECASE)
+    pattern = re.compile(r'(\(\s*(?:v[1-5]|s\d+(?:\.\d+)?|mf[1-5]|m[1-5]|f[1-5]|f)\s*\))', re.IGNORECASE)
     parts = pattern.split(script_text)
 
     sequence = []
@@ -358,12 +407,12 @@ def parse_strict_script(script_text: str, mode: str, max_voices: int = 1):
         if m_tag:
             tag_content = m_tag.group(1).lower()
 
-            # تغيير الشخصية
+            # وسم تبديل الشخصية
             if tag_content.startswith('v') and tag_content[1:].isdigit():
                 cur_voice = min(int(tag_content[1:]) - 1, max_voices - 1)
                 continue
 
-            # السكتة والصمت
+            # وسم الصمت
             if tag_content.startswith('s'):
                 try:
                     dur = float(tag_content[1:])
@@ -372,19 +421,17 @@ def parse_strict_script(script_text: str, mode: str, max_voices: int = 1):
                 except ValueError:
                     pass
 
-            # المؤثرات الصوتية (ممنوعة في المحركات الفردية ومسموحة فقط في السيناريو والمتعدد)
+            # وسوم المؤثرات للسيناريو والمتعدد
             if mode in ["story", "multilang"]:
                 if tag_content.startswith('mf') and tag_content[2:].isdigit():
-                    fx_num = tag_content[2:]
-                    sequence.append({"type": "mf_sound", "fx_id": fx_num})
+                    sequence.append({"type": "mf_sound", "fx_id": tag_content[2:]})
                     continue
                 elif tag_content.startswith('m') and tag_content[1:].isdigit():
-                    fx_num = tag_content[1:]
-                    sequence.append({"type": "m_bgm_start", "fx_id": fx_num})
+                    sequence.append({"type": "m_bgm_start", "fx_id": tag_content[1:]})
                     continue
-                elif tag_content.startswith('f') and tag_content[1:].isdigit():
-                    fx_num = tag_content[1:]
-                    sequence.append({"type": "m_bgm_stop", "fx_id": fx_num})
+                elif tag_content == 'f' or (tag_content.startswith('f') and tag_content[1:].isdigit()):
+                    fx_id = tag_content[1:] if len(tag_content) > 1 else None
+                    sequence.append({"type": "m_bgm_stop", "fx_id": fx_id})
                     continue
 
         # نص عادي يُنطق بصوت الشخصية الحالية
@@ -392,7 +439,7 @@ def parse_strict_script(script_text: str, mode: str, max_voices: int = 1):
 
     return sequence
 
-# ============ تجزئة النصوص للملفات الكبيرة ============
+# ============ تجزئة النصوص ============
 def _sync_split_text_semantically(text: str, max_chars: int = 1000) -> list:
     clean = text.strip()
     if not clean: return []
@@ -659,27 +706,23 @@ async def show_story_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         p_desc = "همس" if s.get("pitch") == "whisper" else s.get("pitch", "normal")
         text += f"  • `(v{i})` {s['voice']} | ⚡{s.get('speed', 1.0)}x | 🎵{p_desc}\n"
 
-    text += f"\n🎵 **المؤثرات الصوتية المرفوعة ({len(user_fx)} / 5):**\n"
+    text += f"\n🎵 **المؤثرات الصوتية والموسيقى المرفوعة ({len(user_fx)} / 5):**\n"
     if not user_fx:
         text += "  *(لم يتم رفع أي مؤثرات صوتية - اختياري)*\n"
     else:
         for fx_id in sorted(user_fx.keys(), key=lambda x: int(x)):
-            text += f"  • `(m{fx_id})` أو `(mf{fx_id})`: مؤثر صوتي {fx_id} ✅\n"
+            text += f"  • `(m{fx_id})` لبدء الموسيقى / `(mf{fx_id})` لفاصل مستقل: مؤثر {fx_id} ✅\n"
 
     buttons = []
-    # زر إضافة شخصية جديدة
     if len(slots) < 5:
         buttons.append([InlineKeyboardButton(f"➕ إضافة شخصية جديدة (v{len(slots)+1})", callback_data="story_add_char")])
 
-    # زر إضافة مؤثر صوتي (بحد أقصى 5)
     if len(user_fx) < 5:
         next_fx = len(user_fx) + 1
         buttons.append([InlineKeyboardButton(f"➕ إضافة مؤثر صوتي ({next_fx}/5)", callback_data="btn_add_fx")])
 
-    # زر ضبط الصوت المخصص لكل شخصية
     buttons.append([InlineKeyboardButton("🎛️ ضبط السرعة والنبرة للأصوات", callback_data="btn_tune_voices")])
 
-    # إنهاء والانتقال للصيغة
     if len(slots) >= 1:
         buttons.append([InlineKeyboardButton("✅ اعتماد الطاقم والانتقال للصيغة", callback_data="btn_finish_crew")])
     buttons.append([InlineKeyboardButton("🔄 إعادة تعيين الطاقم", callback_data="story_reset")])
@@ -701,7 +744,7 @@ async def show_multilang_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     text += f"\n🎵 **المؤثرات الصوتية ({len(user_fx)} / 1):**\n"
     if user_fx:
-        text += "  • `(m1)` أو `(mf1)`: مؤثر صوتي 1 جاهز ✅\n"
+        text += "  • `(m1)` لبدء الموسيقى أو `(mf1)` لفاصل: مؤثر 1 جاهز ✅\n"
     else:
         text += "  *(يمكنك إضافة صوت مؤثر 1 اختياري)*\n"
 
@@ -722,7 +765,7 @@ async def show_multilang_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
     return STEP_MULTILANG_MENU
 
-# ============ معالجة أزرار قوائم الطاقم والمؤثرات ============
+# ============ أزرار إدارة الطاقم والمؤثرات ============
 async def handle_story_menu_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -739,8 +782,8 @@ async def handle_story_menu_callbacks(update: Update, context: ContextTypes.DEFA
         context.user_data["expecting_fx_id"] = str(fx_num)
         msg = (
             f"📥 **أرسل الآن الملف الصوتي للمؤثر رقم ({fx_num}):**\n\n"
-            f"يمكنك إرساله كملف صوتي (Audio) أو تسجيل صوتي (Voice Note).\n"
-            f"سيتم استدعاؤه في السيناريو عبر الكود `(m{fx_num})` أو `(mf{fx_num})`."
+            f"• للتشغيل كموسيقى خلفية مرافقة: استخدم `(m{fx_num})` وإيقافها بـ `(f{fx_num})`.\n"
+            f"• للتشغيل كمقطع مستقل ينتهي أولاً ثم يبدأ الحوار: استخدم `(mf{fx_num})`."
         )
         await query.edit_message_text(msg, parse_mode="Markdown")
         return STEP_WAIT_FX_AUDIO
@@ -765,7 +808,7 @@ async def handle_story_menu_callbacks(update: Update, context: ContextTypes.DEFA
 
     return STEP_STORY_MENU
 
-# ============ استقبال ملف المؤثر الصوتي المخصص ============
+# ============ استقبال ملف المؤثر الصوتي ============
 async def receive_fx_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await gatekeeper(update, context):
         return STEP_TEXT
@@ -793,7 +836,7 @@ async def receive_fx_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user_fx[str(fx_id)] = dest_path
     context.user_data["user_fx"] = user_fx
 
-    await update.message.reply_text(f"✅ تم حفظ المؤثر الصوتي بنجاح! معرّفه: `(m{fx_id})` أو `(mf{fx_id})`", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ تم حفظ المؤثر الصوتي بنجاح! وسومه: `(m{fx_id})` أو `(mf{fx_id})`", parse_mode="Markdown")
 
     mode = context.user_data.get("mode", "story")
     if mode == "story":
@@ -854,7 +897,7 @@ async def render_voice_tuning_card(update: Update, context: ContextTypes.DEFAULT
     await query.edit_message_text(title, reply_markup=InlineKeyboardMarkup([spd_row, pit_row, back_row]), parse_mode="Markdown")
     return STEP_VOICE_CUSTOMIZE
 
-# ============ ضبط السرعة للمحركات الفردية فقط (خالي تماماً من السكتات والـ BGM) ============
+# ============ ضبط السرعة للمحركات الفردية ============
 async def ask_speed_single(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     spd = context.user_data.get("speed", 1.0)
@@ -950,10 +993,10 @@ async def select_format(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     mode = context.user_data.get("mode", "single")
     info = (
         "🎬 **أرسل نص السيناريو الآن (أو مستند .docx/.txt/.srt)**\n\n"
-        "💡 **الوسوم المتاحة:**\n"
+        "💡 **الوسوم المدعومة:**\n"
         "• `(v1)` إلى `(v5)` للشخصيات.\n"
         "• `(s2)` لصمت 2 ثانية.\n"
-        "• `(m1)` لبدء مؤثر صوتي مسبق الرفع، و`(f1)` لإيقافه.\n"
+        "• `(m1)` لبدء الموسيقى الخلفية المرافقة، و`(f1)` أو `(f)` لإيقافها.\n"
         "• `(mf1)` لتشغيل المؤثر بالكامل قبل مواصلة الحوار."
         if mode == "story" else
         "🔹 **أرسل النص المطلوب تحويله الآن (أو مستند):**"
@@ -961,7 +1004,7 @@ async def select_format(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     await query.edit_message_text(f"{info}\n\n📁 الصيغة المحددة: `({chosen.upper()})`", parse_mode="Markdown")
     return STEP_TEXT
 
-# ============ التنفيذ والتوليد مع الحذف الشامل للمخلفات ============
+# ============ التنفيذ والدمج الحي للموسيقى الخلفية (BGM Mixer) ============
 def get_user_queue(user_id: int) -> asyncio.Queue:
     if user_id not in USER_TASK_QUEUES:
         USER_TASK_QUEUES[user_id] = asyncio.Queue()
@@ -1002,26 +1045,26 @@ async def enqueue_task(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
 async def execute_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str):
     user_id = update.effective_user.id
     sem = get_tts_semaphore()
-    status_msg = await update.message.reply_text("⏳ **جاري معالجة وتوليد الصوت بالاستوديو...**", parse_mode="Markdown")
+    status_msg = await update.message.reply_text("⏳ **جاري معالجة وهندسة الصوت بالاستوديو...**", parse_mode="Markdown")
 
     async with sem:
         try:
             await _do_generate(update, context, user_text, status_msg)
         finally:
-            # تنظيف فوري لجميع المؤثرات والملفات الصوتية بعد العمل تماماً
+            # تنظيف فوري لجميع المؤثرات والملفات المؤقتة للمستخدم
             udir = os.path.join(USER_ASSETS_DIR, str(user_id))
             if os.path.exists(udir):
                 shutil.rmtree(udir, ignore_errors=True)
             context.user_data["user_fx"] = {}
 
 async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str, status_msg):
-    user_id = update.effective_user.id
     mode = context.user_data.get("mode", "single")
     audio_format = context.user_data.get("audio_format", "mp3")
     user_fx = context.user_data.get("user_fx", {})
 
     with tempfile.TemporaryDirectory() as tmpdir:
         chunks = []
+        active_bgm_file = None  # المسار الحالي للموسيقى الخلفية النشطة أثناء الحوار
 
         if mode == "story":
             slots = context.user_data.get("story_slots", [])
@@ -1031,28 +1074,56 @@ async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
 
             for idx, item in enumerate(sequence):
                 cf = os.path.join(tmpdir, f"st_{idx}.mp3")
-                if item["type"] == "silence":
+
+                # 1. بدء الموسيقى الخلفية
+                if item["type"] == "m_bgm_start":
+                    active_bgm_file = user_fx.get(str(item["fx_id"]))
+                    continue
+
+                # 2. إيقاف الموسيقى الخلفية
+                elif item["type"] == "m_bgm_stop":
+                    active_bgm_file = None
+                    continue
+
+                # 3. الصمت
+                elif item["type"] == "silence":
                     if await create_silence(item["duration"], cf):
                         chunks.append(cf)
+
+                # 4. مقطع مستقل (ينتهي بالكامل ثم يستأنف الكلام)
                 elif item["type"] == "mf_sound":
                     fx_path = user_fx.get(str(item["fx_id"]))
                     if fx_path and os.path.exists(fx_path):
                         if await normalize_to_mp3(fx_path, cf):
                             chunks.append(cf)
+
+                # 5. الحوار والكلام
                 elif item["type"] == "speech":
                     slot = slots[item["voice_idx"]]
                     pieces = await split_text_semantically(item["text"])
                     for j, p in enumerate(pieces):
-                        sub_cf = os.path.join(tmpdir, f"sp_{idx}_{j}.mp3")
-                        if await synthesize_chunk(p, slot["engine"], slot["voice"], sub_cf, speed=slot.get("speed", 1.0), pitch=slot.get("pitch", "normal")):
-                            chunks.append(sub_cf)
+                        sub_raw = os.path.join(tmpdir, f"raw_{idx}_{j}.mp3")
+                        sub_final = os.path.join(tmpdir, f"sp_{idx}_{j}.mp3")
+                        if await synthesize_chunk(p, slot["engine"], slot["voice"], sub_raw, speed=slot.get("speed", 1.0), pitch=slot.get("pitch", "normal")):
+                            # إن كانت هناك موسيقى مرافقة مفعّلة بـ (m)، يتم دمجها تحت الحوار
+                            if active_bgm_file and os.path.exists(active_bgm_file):
+                                await overlay_bgm_on_speech(sub_raw, active_bgm_file, sub_final, bgm_vol=0.18)
+                            else:
+                                shutil.copy(sub_raw, sub_final)
+                            chunks.append(sub_final)
 
         elif mode == "multilang":
             slots = context.user_data.get("multilang_slots", [])
             sequence = parse_strict_script(user_text, mode="multilang", max_voices=len(slots))
             for idx, item in enumerate(sequence):
                 cf = os.path.join(tmpdir, f"ml_{idx}.mp3")
-                if item["type"] == "silence":
+                if item["type"] == "m_bgm_start":
+                    active_bgm_file = user_fx.get(str(item["fx_id"]))
+                    continue
+                elif item["type"] == "m_bgm_stop":
+                    active_bgm_file = None
+                    continue
+                elif item["type"] == "silence":
                     if await create_silence(item["duration"], cf): chunks.append(cf)
                 elif item["type"] == "mf_sound":
                     fx_path = user_fx.get(str(item["fx_id"]))
@@ -1062,9 +1133,14 @@ async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
                     slot = slots[item["voice_idx"]]
                     pieces = await split_text_semantically(item["text"])
                     for j, p in enumerate(pieces):
-                        sub_cf = os.path.join(tmpdir, f"sp_ml_{idx}_{j}.mp3")
-                        if await synthesize_chunk(p, slot["engine"], slot["voice"], sub_cf, speed=slot.get("speed", 1.0)):
-                            chunks.append(sub_cf)
+                        sub_raw = os.path.join(tmpdir, f"raw_ml_{idx}_{j}.mp3")
+                        sub_final = os.path.join(tmpdir, f"sp_ml_{idx}_{j}.mp3")
+                        if await synthesize_chunk(p, slot["engine"], slot["voice"], sub_raw, speed=slot.get("speed", 1.0)):
+                            if active_bgm_file and os.path.exists(active_bgm_file):
+                                await overlay_bgm_on_speech(sub_raw, active_bgm_file, sub_final, bgm_vol=0.18)
+                            else:
+                                shutil.copy(sub_raw, sub_final)
+                            chunks.append(sub_final)
         else:
             # نمط الصوت الفردي
             engine = context.user_data.get("engine", "neural")
@@ -1086,7 +1162,7 @@ async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
         if not chunks:
             raise Exception("لم يتم توليد أي صوت.")
 
-        # دمج المقاطع
+        # دمج المقاطع الناتجة
         list_file = os.path.join(tmpdir, "concat.txt")
         with open(list_file, "w", encoding="utf-8") as f:
             for c in chunks:
@@ -1105,7 +1181,7 @@ async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
             if audio_format == "ogg":
                 await update.message.reply_voice(voice=af, caption="✅ تم توليد الرسالة الصوتية بنجاح!")
             else:
-                await update.message.reply_audio(audio=af, title="Studio TTS Master", performer="Smart Studio", caption="🎬 **تم اكتمال الصوت بدقة الاستوديو!**")
+                await update.message.reply_audio(audio=af, title="Studio TTS Master", performer="Smart Studio", caption="🎬 **تم اكتمال هندسة السيناريو والمؤثرات بنجاح!**")
         try:
             await status_msg.delete()
         except Exception:
@@ -1191,7 +1267,7 @@ async def on_startup(app):
     init_fast_json()
     init_creative_json()
     asyncio.create_task(background_pruner())
-    print("🚀 البوت المتكامل جاهز ومحمي تماماً من أخطاء الـ Regex ومعزول بالكامل!")
+    print("🚀 البوت المتكامل جاهز ومحمي بالكامل مع دعم الموسيقى المرافقة والـ 26 لغة كاملة!")
 
 def main():
     app = (
