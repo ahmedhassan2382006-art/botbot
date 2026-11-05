@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 # ============ إعدادات البيئة والتوكنات ============
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "ضع_توكن_البوت_هنا")
 ADM_TOKEN = os.environ.get("ADM", "").strip()  # توكن جيت هب المخزن في Secrets
+BACKUP_REPO_OWNER = "ahmedhassan2382006-art"
 BACKUP_REPO_NAME = "data"
 
 CHANNELS_TO_CHECK = [
@@ -94,19 +95,22 @@ DEFAULT_CONFIG = {
 }
 
 # ============ نظام النسخ الاحتياطي لمستودع data عبر توكن ADM ============
-async def github_api_request(method: str, endpoint: str, payload: dict = None) -> dict:
+async def github_api_request(method: str, endpoint: str, payload: dict = None, accept_header: str = None):
     if not ADM_TOKEN:
         return None
     url = f"https://api.github.com/{endpoint.lstrip('/')}"
     headers = {
         "Authorization": f"Bearer {ADM_TOKEN}",
-        "Accept": "application/vnd.github+json",
+        "Accept": accept_header or "application/vnd.github+json",
+        "User-Agent": "Telegram-TTS-Bot-Backup",
         "X-GitHub-Api-Version": "2022-11-28"
     }
     async with aiohttp.ClientSession() as session:
         try:
             async with session.request(method, url, headers=headers, json=payload) as resp:
                 if resp.status in [200, 201]:
+                    if accept_header == "application/vnd.github.raw+json":
+                        return await resp.read()
                     return await resp.json()
                 elif resp.status == 404:
                     return {"status": 404}
@@ -120,13 +124,13 @@ async def github_api_request(method: str, endpoint: str, payload: dict = None) -
 
 async def github_get_authenticated_user() -> str:
     res = await github_api_request("GET", "user")
-    if res and "login" in res:
+    if res and isinstance(res, dict) and "login" in res:
         return res["login"]
-    return None
+    return BACKUP_REPO_OWNER
 
 async def github_ensure_repo_exists(owner: str):
     res = await github_api_request("GET", f"repos/{owner}/{BACKUP_REPO_NAME}")
-    if res and res.get("status") == 404:
+    if res and isinstance(res, dict) and res.get("status") == 404:
         logger.info(f"📁 المستودع {BACKUP_REPO_NAME} غير موجود، جاري إنشاؤه تلقائياً...")
         await github_api_request("POST", "user/repos", {
             "name": BACKUP_REPO_NAME,
@@ -140,10 +144,6 @@ async def github_restore_latest_db():
         return
 
     owner = await github_get_authenticated_user()
-    if not owner:
-        logger.error("❌ فشل التحقق من توكن ADM الخاص بجيت هب.")
-        return
-
     await github_ensure_repo_exists(owner)
     contents = await github_api_request("GET", f"repos/{owner}/{BACKUP_REPO_NAME}/contents/")
     
@@ -152,16 +152,29 @@ async def github_restore_latest_db():
         if db_files:
             db_files.sort(key=lambda x: x["name"])
             latest = db_files[-1]
-            download_url = latest.get("download_url")
-            logger.info(f"📥 جاري استرجاع أحدث ملف بيانات: {latest['name']}...")
-            async with aiohttp.ClientSession() as session:
-                async with session.get(download_url) as resp:
-                    if resp.status == 200:
-                        data = await resp.read()
-                        with open(DB_FILE, "wb") as f:
-                            f.write(data)
-                        logger.info("✅ تم بنجاح استرجاع وتثبيت أحدث نسخة من البيانات!")
-                        return
+            file_name = latest["name"]
+            logger.info(f"📥 جاري استرجاع أحدث ملف بيانات: {file_name}...")
+            
+            # جلب المحتوى مع ترويسة التوثيق للمستودع الخاص
+            raw_data = await github_api_request(
+                "GET", 
+                f"repos/{owner}/{BACKUP_REPO_NAME}/contents/{file_name}",
+                accept_header="application/vnd.github.raw+json"
+            )
+            if raw_data and isinstance(raw_data, (bytes, bytearray)):
+                with open(DB_FILE, "wb") as f:
+                    f.write(raw_data)
+                logger.info(f"✅ تم بنجاح استرجاع وتثبيت أحدث نسخة من البيانات ({file_name})!")
+                return
+            else:
+                # محاولة بديلة عبر فك Base64
+                file_info = await github_api_request("GET", f"repos/{owner}/{BACKUP_REPO_NAME}/contents/{file_name}")
+                if file_info and isinstance(file_info, dict) and "content" in file_info:
+                    decoded = base64.b64decode(file_info["content"])
+                    with open(DB_FILE, "wb") as f:
+                        f.write(decoded)
+                    logger.info(f"✅ تم بنجاح استرجاع البيانات وفك تشفيرها ({file_name})!")
+                    return
     logger.info("ℹ️ لم يتم العثور على نسخ سابقة، سيتم إنشاء قاعدة بيانات جديدة والبدء من الصفر.")
 
 async def github_upload_backup():
@@ -169,32 +182,41 @@ async def github_upload_backup():
         return
 
     owner = await github_get_authenticated_user()
-    if not owner:
-        return
-
     await github_ensure_repo_exists(owner)
     
     # تنظيف الخاملين قبل رفع النسخة
     db_prune_inactive(days=10)
 
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
     file_name = f"backup_{timestamp}.db"
     
-    with open(DB_FILE, "rb") as f:
-        file_bytes = f.read()
-    b64_content = base64.b64encode(file_bytes).decode("utf-8")
+    try:
+        with open(DB_FILE, "rb") as f:
+            file_bytes = f.read()
+        b64_content = base64.b64encode(file_bytes).decode("utf-8")
 
-    payload = {
-        "message": f"Auto-backup at {timestamp} [skip ci]",
-        "content": b64_content
-    }
-    
-    res = await github_api_request("PUT", f"repos/{owner}/{BACKUP_REPO_NAME}/contents/{file_name}", payload)
-    if res:
-        logger.info(f"💾 تم رفع نسخة احتياطية جديدة بنجاح إلى مستودع {BACKUP_REPO_NAME}: {file_name}")
+        payload = {
+            "message": f"Auto-backup at {timestamp} [skip ci]",
+            "content": b64_content
+        }
+        
+        res = await github_api_request("PUT", f"repos/{owner}/{BACKUP_REPO_NAME}/contents/{file_name}", payload)
+        if res and isinstance(res, dict) and "content" in res:
+            logger.info(f"💾 تم رفع نسخة احتياطية جديدة بنجاح إلى مستودع {BACKUP_REPO_NAME}: {file_name}")
+        else:
+            logger.warning(f"⚠️ لم تتم عملية رفع النسخة الاحتياطية بنجاح إلى مستودع {BACKUP_REPO_NAME}")
+    except Exception as e:
+        logger.error(f"خطأ أثناء قراءة أو رفع النسخة الاحتياطية: {e}")
 
 # مهمة النسخ الاحتياطي التلقائي الدوري كل 7 دقائق
 async def periodic_backup_task():
+    # انتظار دقيقة واحدة بعد الإقلاع للتأكد من حفظ الإعدادات ورفع نسخة فورية
+    await asyncio.sleep(60)
+    try:
+        await github_upload_backup()
+    except Exception as e:
+        logger.error(f"خطأ أثناء مهمة النسخ الاحتياطي الأولى: {e}")
+
     while True:
         await asyncio.sleep(420)  # 7 دقائق = 420 ثانية
         try:
@@ -221,13 +243,19 @@ def db_touch_user(user_id: str, config: dict = None):
     cur = conn.cursor()
     now = datetime.utcnow().isoformat()
     if config:
-        clean_cfg = dict(config)
-        clean_cfg.pop("user_fx", None)
+        clean_cfg = {}
+        for k, v in config.items():
+            if k == "user_fx":
+                continue
+            if isinstance(v, set):
+                clean_cfg[k] = list(v)
+            else:
+                clean_cfg[k] = v
         cur.execute("""
             INSERT INTO users (user_id, config_json, last_active)
             VALUES (?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET config_json=excluded.config_json, last_active=excluded.last_active
-        """, (str(user_id), json.dumps(clean_cfg, ensure_ascii=False), now))
+        """, (str(user_id), json.dumps(clean_cfg, ensure_ascii=False, default=str), now))
     else:
         cur.execute("UPDATE users SET last_active = ? WHERE user_id = ?", (now, str(user_id)))
     conn.commit()
@@ -652,7 +680,7 @@ async def select_engine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     elif engine == "multilang":
         context.user_data["multilang_slots"] = []
         context.user_data["user_fx"] = {}
-        context.user_data["used_langs"] = set()
+        context.user_data["used_langs"] = []
         return await show_sub_engines(update, context, slot_num=1, mode="multilang")
     else:
         context.user_data["engine"] = engine
@@ -692,7 +720,7 @@ async def setup_language_selection(update: Update, context: ContextTypes.DEFAULT
 
     mode = context.user_data.get("mode", "")
     if mode == "multilang":
-        used = context.user_data.get("used_langs", set())
+        used = set(context.user_data.get("used_langs", []))
         keys = [k for k in all_keys if k not in used]
     else:
         keys = all_keys
@@ -804,7 +832,7 @@ async def on_voice_selected(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         slots = context.user_data.get("multilang_slots", [])
         slots.append(slot)
         context.user_data["multilang_slots"] = slots
-        context.user_data["used_langs"] = {s["lang"] for s in slots}
+        context.user_data["used_langs"] = list({s["lang"] for s in slots})
         return await show_multilang_menu(update, context)
     else:
         context.user_data["voice"] = voice_id
@@ -919,6 +947,7 @@ async def handle_story_menu_callbacks(update: Update, context: ContextTypes.DEFA
         context.user_data["story_slots"] = []
         context.user_data["multilang_slots"] = []
         context.user_data["user_fx"] = {}
+        context.user_data["used_langs"] = []
         return await show_sub_engines(update, context, slot_num=1, mode=mode)
 
     return STEP_STORY_MENU
@@ -1105,11 +1134,11 @@ async def select_format(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     info = (
         "🎬 **أرسل نص السيناريو الآن (أو مستند .docx/.txt/.srt)**\n\n"
         "💡 **الوسوم المدعومة:**\n"
-        "• `(v1)` إلى `(v5)` للشخصيات.\n"
+        "• `(v1)` إلى `(v5)` للشخصيات أو اللغات.\n"
         "• `(s2)` لصمت 2 ثانية.\n"
         "• `(m1)` لبدء الموسيقى الخلفية المرافقة، و`(f1)` أو `(f)` لإيقافها.\n"
         "• `(mf1)` لتشغيل المؤثر بالكامل قبل مواصلة الحوار."
-        if mode == "story" else
+        if mode in ("story", "multilang") else
         "🔹 **أرسل النص المطلوب تحويله الآن (أو مستند):**"
     )
     await query.edit_message_text(f"{info}\n\n📁 الصيغة المحددة: `({chosen.upper()})`", parse_mode="Markdown")
@@ -1154,7 +1183,6 @@ async def process_queued_task(sem, update, context, text, status_msg, q):
 
 async def enqueue_task(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     q = get_global_queue()
-    # رسالة راقية ومطمئنة بدون أي ذكر لكلمة "طابور" أو "أدوار"
     status_msg = await update.message.reply_text(
         "⏳ **جاري استلام طلبك وهندسة الصوت بدقة عالية...**\n"
         "يرجى الانتظار قليلاً، سوف يستغرق التوليد بضع لحظات وسنرسل لك المقطع الصوتي مباشرة 🌸",
@@ -1230,7 +1258,7 @@ async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
                     for j, p in enumerate(pieces):
                         sub_raw = os.path.join(tmpdir, f"raw_ml_{idx}_{j}.mp3")
                         sub_final = os.path.join(tmpdir, f"sp_ml_{idx}_{j}.mp3")
-                        if await synthesize_chunk(p, slot["engine"], slot["voice"], sub_raw, speed=slot.get("speed", 1.0)):
+                        if await synthesize_chunk(p, slot["engine"], slot["voice"], sub_raw, speed=slot.get("speed", 1.0), pitch=slot.get("pitch", "normal")):
                             if active_bgm_file and os.path.exists(active_bgm_file):
                                 await overlay_bgm_on_speech(sub_raw, active_bgm_file, sub_final, bgm_vol=0.18)
                             else:
@@ -1366,7 +1394,7 @@ async def on_startup(app):
     init_creative_json()
     asyncio.create_task(background_pruner())
     asyncio.create_task(global_queue_worker())
-    asyncio.create_task(periodic_backup_task())  # تشغيل النسخ الاحتياطي التلقائي كل 7 دقائق
+    asyncio.create_task(periodic_backup_task())  # تشغيل النسخ الاحتياطي التلقائي الدوري كل 7 دقائق
     print("🚀 البوت متصل بنظام الحفظ التلقائي لمستودع data ونظام المعالجة الهادئ!")
 
 def main():
