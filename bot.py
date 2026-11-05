@@ -10,14 +10,17 @@ import asyncio
 import subprocess
 import tempfile
 import time
+import sqlite3
+from datetime import datetime, timedelta
 import aiohttp
-from datetime import datetime
 from gtts import gTTS
 import edge_tts
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember
+)
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ContextTypes, ConversationHandler, filters,
+    MessageHandler, ContextTypes, ConversationHandler, filters
 )
 
 # ============ مكتبات اختيارية ============
@@ -43,13 +46,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "ضع_توكن_البوت_هنا")
+
+# ============ قنوات ومجموعة الاشتراك الإجباري ============
+REQUIRED_CHANNELS = [
+    {"name": "قناة الشروحات التقنية", "id": "@Basira_Tech", "link": "https://t.me/Basira_Tech"},
+    {"name": "قناة مشاريع المطور", "id": "@AhmedHassanProjects", "link": "https://t.me/AhmedHassanProjects"},
+    # للمجموعات الخاصة ضع المعرف الرقمي السالب (مثال: -100123456789) في متغير البيئة GROUP_CHAT_ID بعد رفع البوت مشرفاً فيها
+    {"name": "مجموعة النقاش والتعليقات", "id": os.environ.get("GROUP_CHAT_ID", "@Basira_Tech"), "link": "https://t.me/+6e6e1QVB4z8xMGE0"}
+]
+
+DB_FILE = "bot_database.db"
+USER_ASSETS_DIR = "user_audio_assets"
+os.makedirs(USER_ASSETS_DIR, exist_ok=True)
 
 FILE_NEURAL_JSON = "neural_voices.json"
 FILE_FAST_JSON = "fast_voices.json"
 FILE_CREATIVE_JSON = "creative_voices.json"
-USER_CONFIG_FILE = "users_config.json"
 BGM_FILE = "background_music.mp3"
+
+MAX_TEXT_LEN = 30000
 
 # ============ الحالات ============
 (
@@ -58,12 +74,12 @@ BGM_FILE = "background_music.mp3"
     STEP_FORMAT, STEP_TEXT, STEP_VOICE_CUSTOMIZE,
 ) = range(10)
 
-# ============ قواعد البيانات ============
+# ============ قواعد البيانات المؤقتة ============
 DB_NEURAL = {}
 DB_FAST = {}
 DB_CREATIVE = {}
 
-# ============ طابور المعالجة وإدارة العمليات ============
+# ============ طابور المعالجة ============
 USER_TASK_QUEUES = {}
 USER_CURRENT_TASK = {}
 USER_WORKERS = {}
@@ -90,39 +106,114 @@ DEFAULT_CONFIG = {
     "bgm_duration": 30,
 }
 
-# ============ إدارة الإعدادات الدائمة ============
-def load_all_user_configs() -> dict:
-    if os.path.exists(USER_CONFIG_FILE):
+# ============ إدارة قاعدة بيانات SQLite الذاتية ============
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            config_json TEXT,
+            last_active TIMESTAMP
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pending_sessions (
+            user_id TEXT PRIMARY KEY,
+            text_data TEXT,
+            missing_assets TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def db_touch_user(user_id: str, config: dict = None):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    now = datetime.utcnow().isoformat()
+    if config:
+        cur.execute("""
+            INSERT INTO users (user_id, config_json, last_active)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET config_json=excluded.config_json, last_active=excluded.last_active
+        """, (str(user_id), json.dumps(config, ensure_ascii=False), now))
+    else:
+        cur.execute("UPDATE users SET last_active = ? WHERE user_id = ?", (now, str(user_id)))
+    conn.commit()
+    conn.close()
+
+def db_get_config(user_id: str) -> dict:
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT config_json FROM users WHERE user_id = ?", (str(user_id),))
+    row = cur.fetchone()
+    conn.close()
+    if row and row[0]:
         try:
-            with open(USER_CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+            merged = dict(DEFAULT_CONFIG)
+            merged.update(json.loads(row[0]))
+            return merged
         except Exception:
-            return {}
-    return {}
+            return dict(DEFAULT_CONFIG)
+    return dict(DEFAULT_CONFIG)
 
-def save_user_config(user_id: str, config: dict):
-    configs = load_all_user_configs()
-    clean_config = {}
-    for k in (
-        "mode", "engine", "voice", "voice_name", "selected_lang", "selected_dia",
-        "audio_format", "speed", "pitch", "volume", "pause_duration",
-        "story_slots", "multilang_slots", "bgm_enabled", "bgm_mode", "bgm_duration"
-    ):
-        if k in config:
-            clean_config[k] = config[k]
-    configs[str(user_id)] = clean_config
+def db_prune_inactive(days: int = 10):
     try:
-        with open(USER_CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(configs, f, ensure_ascii=False, indent=2)
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.cursor()
+        threshold = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        cur.execute("SELECT user_id FROM users WHERE last_active < ?", (threshold,))
+        expired = [r[0] for r in cur.fetchall()]
+        for uid in expired:
+            cur.execute("DELETE FROM users WHERE user_id = ?", (uid,))
+            cur.execute("DELETE FROM pending_sessions WHERE user_id = ?", (uid,))
+            udir = os.path.join(USER_ASSETS_DIR, str(uid))
+            if os.path.exists(udir):
+                shutil.rmtree(udir, ignore_errors=True)
+        conn.commit()
+        conn.close()
+        if expired:
+            logger.info(f"🧹 تم حذف إعدادات وملفات {len(expired)} حسابات خاملة منذ 10 أيام.")
     except Exception as e:
-        logger.error(f"Failed to save user config: {e}")
+        logger.error(f"خطأ تنظيف الحسابات: {e}")
 
-def get_saved_user_config(user_id: str) -> dict:
-    configs = load_all_user_configs()
-    saved = configs.get(str(user_id), {})
-    merged = dict(DEFAULT_CONFIG)
-    merged.update(saved)
-    return merged
+# ============ فحص الاشتراك الإجباري الصارم ============
+async def check_user_subscription(bot, user_id: int) -> tuple[bool, list]:
+    missing = []
+    for ch in REQUIRED_CHANNELS:
+        try:
+            member = await bot.get_chat_member(chat_id=ch["id"], user_id=user_id)
+            if member.status not in [ChatMember.MEMBER, ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
+                missing.append(ch)
+        except Exception as e:
+            logger.warning(f"تعذر فحص {ch['id']}: {e}")
+    return (len(missing) == 0, missing)
+
+async def gatekeeper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    if not user:
+        return False
+    db_touch_user(str(user.id))
+    ok, missing = await check_user_subscription(context.bot, user.id)
+    if not ok:
+        keyboard = []
+        for ch in missing:
+            keyboard.append([InlineKeyboardButton(f"📢 اشترك في: {ch['name']}", url=ch["link"])])
+        keyboard.append([InlineKeyboardButton("🔄 تحقق من الاشتراك الآن", callback_data="btn_recheck_sub")])
+        msg_text = (
+            f"⚠️ **مرحباً يا {user.first_name}!**\n\n"
+            f"لاستخدام البوت بكافة ميزاته مجاناً، يجب عليك أولاً الاشتراك في قنوات ومجموعة المطور الرسمية:\n\n"
+            f"👇 اشترك من الأزرار بالأسفل ثم اضغط زر التحقق:"
+        )
+        if update.callback_query:
+            try:
+                await update.callback_query.message.edit_text(msg_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+            except Exception:
+                await update.callback_query.message.reply_text(msg_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        elif update.message:
+            await update.message.reply_text(msg_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return False
+    return True
 
 # ============ أسماء اللغات ============
 NATIVE_LANG_NAMES = {
@@ -155,9 +246,11 @@ I18N = {
         "story_btn_finish": "🎬 اعتماد الطاقم والانتقال للخيارات المتقدمة",
         "story_btn_reset": "🔄 إعادة تعيين الشخصيات",
         "story_step_text": ("🔹 **أرسل نص سيناريو الحوار.**\n\n"
-                            "💡 **طريقة الكتابة:** ضع رمز الشخصية `(vالرقم)` في بداية كلامها:\n\n"
-                            "*(v1) مرحباً يا أحمد، هل أتممت كتابة التقرير؟*\n"
-                            "*(v2) بصوت خافت: نعم يا سارة، انتهيت منه للتو.*"),
+                            "💡 **الوسوم المدعومة:**\n"
+                            "• `(V1)` إلى `(V5)` لاختيار الشخصية المتكلمة.\n"
+                            "• `(S5)` لصمت مدته 5 ثوانٍ.\n"
+                            "• `(MFاسم)` لتشغيل مقطع صوتي/مؤثر بالكامل ثم استئناف الكلام.\n"
+                            "• `(Mاسم)` لبدء موسيقى خلفية مرافقة للحوار، و`(Fاسم)` لإيقافها."),
         "multilang_intro": ("🌐 **محرك متعدد اللغات التلقائي**\n\n"
                             "يتعرف تلقائياً على اللغات ويوزع كل لغة على صوتها الأصلي بدقة!\n"
                             "🔹 اختر المحرك الصوتي للغة الأولى:"),
@@ -175,8 +268,8 @@ I18N = {
         "back": "🔙 رجوع",
         "eng_neural": "المحرك العصبي الفائق (جودة استوديو)",
         "eng_fast": "المحرك السريع القياسي (خفيف)",
-        "eng_creative": "المحرك التعبيري الحديث (شخصيات)",
-        "eng_story": "محرك القصص والسيناريو (تخصيص كامل للأصوات) 🎬",
+        "eng_creative": "المحرك التعبيري الحديث (TikTok TTS)",
+        "eng_story": "محرك القصص والسيناريو والمؤثرات 🎬",
         "eng_multilang": "محرك متعدد اللغات الذكي 🌐",
         "error": "⚠️ حدث خطأ أثناء معالجة الصوت، يرجى المحاولة لاحقاً.",
         "doc_unsupported": "❌ صيغة الملف غير مدعومة. الصيغ المعتمدة: .docx .txt .srt",
@@ -187,19 +280,17 @@ I18N = {
         "preview_only_single": "🔊 المعاينة متاحة في وضع الصوت الفردي.",
         "continue_btn": "✅ متابعة",
         "preview_btn": "🔊 معاينة الصوت",
-        "need_start": "🔹 مرحباً بك! يرجى إرسال /start أو ضبط الإعدادات عبر /settings أولاً.",
         "part_label": "📦 **الجزء ({part} من {total})**\n",
     }
 }
 
 def t(update: Update, key: str, **kwargs) -> str:
-    user_lang = "ar"
-    text = I18N[user_lang].get(key, I18N["ar"].get(key, ""))
+    text = I18N["ar"].get(key, "")
     if kwargs:
         return text.format(**kwargs)
     return text
 
-# ============ تحضير قواعد بيانات الأصوات ============
+# ============ تجهيز قواعد بيانات الأصوات ============
 async def init_neural_json():
     global DB_NEURAL
     if os.path.exists(FILE_NEURAL_JSON):
@@ -286,20 +377,15 @@ def init_creative_json():
         json.dump(db, f, ensure_ascii=False, indent=2)
     DB_CREATIVE = db
 
-# ============ أدوات FFmpeg الاحترافية ============
-async def run_ffmpeg(args: list, timeout: int = 180) -> bool:
+# ============ دوال FFmpeg ومعالجة الصوت ============
+async def run_ffmpeg(args: list, timeout: int = 240) -> bool:
     if not shutil.which("ffmpeg"):
         return False
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", *args,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            "ffmpeg", *args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-        try:
-            await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            proc.kill()
-            return False
+        await asyncio.wait_for(proc.communicate(), timeout=timeout)
         return proc.returncode == 0
     except Exception as e:
         logger.warning(f"ffmpeg error: {e}")
@@ -338,6 +424,12 @@ async def create_silence(duration: float, output_file: str) -> bool:
         "-t", f"{duration:.2f}", "-c:a", "libmp3lame", "-q:a", "9", "-y", output_file
     ])
 
+async def normalize_to_mp3(input_file: str, output_file: str) -> bool:
+    return await run_ffmpeg([
+        "-i", input_file, "-ar", "44100", "-ac", "2",
+        "-c:a", "libmp3lame", "-q:a", "2", "-y", output_file
+    ])
+
 async def merge_audio_files(file_list: list, output_file: str, audio_format: str = "mp3",
                             pause_duration: float = 0.5, bgm_config: dict = None):
     valid = [fp for fp in file_list if os.path.exists(fp) and os.path.getsize(fp) > 0]
@@ -345,20 +437,10 @@ async def merge_audio_files(file_list: list, output_file: str, audio_format: str
         raise Exception("No valid audio chunks to merge")
 
     tmpdir = os.path.dirname(output_file) or "."
-    if not shutil.which("ffmpeg"):
-        with open(output_file, "wb") as out:
-            for fp in valid:
-                with open(fp, "rb") as f:
-                    out.write(f.read())
-        return
-
     normalized = []
     for i, fp in enumerate(valid):
         nfp = os.path.join(tmpdir, f"norm_{i}_{uuid.uuid4().hex[:6]}.mp3")
-        ok = await run_ffmpeg([
-            "-i", fp, "-ar", "44100", "-ac", "1",
-            "-c:a", "libmp3lame", "-q:a", "2", "-y", nfp
-        ])
+        ok = await normalize_to_mp3(fp, nfp)
         normalized.append(nfp if ok and os.path.exists(nfp) else fp)
 
     interleaved = []
@@ -383,7 +465,7 @@ async def merge_audio_files(file_list: list, output_file: str, audio_format: str
     if not await run_ffmpeg(["-f", "concat", "-safe", "0", "-i", list_file, "-c", "copy", "-y", merged_mp3]):
         raise Exception("Merge failed")
 
-    # ============ دمج الموسيقى الخلفية ============
+    # الموسيقى الخلفية العامة إن وُجدت
     if bgm_config and bgm_config.get("enabled") and os.path.exists(BGM_FILE):
         bgm_mixed = os.path.join(tmpdir, f"bgm_{uuid.uuid4().hex[:6]}.mp3")
         mode = bgm_config.get("mode", "loop")
@@ -416,7 +498,7 @@ async def merge_audio_files(file_list: list, output_file: str, audio_format: str
     else:
         shutil.copy(merged_mp3, output_file)
 
-# ============ توليد مقطع صوتي لكل صوت بإعداداته الخاصة ============
+# ============ توليد المقاطع الفردية ============
 async def synthesize_chunk(text: str, engine: str, voice: str, out_file: str,
                            speed: float = 1.0, pitch: str = "normal", volume: float = 1.0) -> bool:
     clean_text = text.strip()
@@ -447,6 +529,7 @@ async def synthesize_chunk(text: str, engine: str, voice: str, out_file: str,
         return True
 
     else:
+        # محرك TikTok (Creative) الأصلي
         global GLOBAL_HTTP_SESSION
         if GLOBAL_HTTP_SESSION is None or GLOBAL_HTTP_SESSION.closed:
             GLOBAL_HTTP_SESSION = aiohttp.ClientSession()
@@ -464,7 +547,7 @@ async def synthesize_chunk(text: str, engine: str, voice: str, out_file: str,
                 return True
             raise Exception("Creative TTS error")
 
-# ============ التقطيع الذكي ============
+# ============ التقطيع والتحليل وتجزئة الأحجام ============
 def _sync_split_text_semantically(text: str, max_chars: int = 1000) -> list:
     clean_text = text.strip()
     if not clean_text:
@@ -518,7 +601,7 @@ def partition_chunks_by_target_size(chunk_paths: list, audio_format: str) -> lis
         batches.append(current_batch)
     return batches or [chunk_paths]
 
-# ============ تمييز وتحليل اللغات ============
+# ============ تمييز وتحليل اللغات المتعددة ============
 def _sync_classify_language(text: str, candidate_langs: list) -> str:
     if re.search(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]', text):
         return "ar" if "ar" in candidate_langs else candidate_langs[0]
@@ -562,21 +645,69 @@ def _sync_parse_multilang_text(full_text: str, lang_slots: list):
 async def parse_multilang_text(full_text: str, lang_slots: list):
     return await asyncio.to_thread(_sync_parse_multilang_text, full_text, lang_slots)
 
-def parse_story_dialogue(full_text: str, max_voices: int):
-    parts = re.split(r'[\(\[]\s*[vV]([1-5])\s*[\)\]][: \t]*', full_text)
-    segments = []
-    if parts[0].strip():
-        segments.append((0, parts[0].strip()))
-    for i in range(1, len(parts), 2):
-        v_idx = int(parts[i]) - 1
-        content = parts[i + 1].strip() if i + 1 < len(parts) else ""
-        if content:
-            if v_idx >= max_voices:
-                v_idx = 0
-            segments.append((v_idx, content))
-    return segments
+# ============ محلل وسوم السيناريو المتقدم (M, MF, S, V) ============
+def parse_advanced_scenario(script_text: str, max_voices: int):
+    tag_regex = re.compile(r'[\(\[]\s*([vVsSmMfF]+[0-9a-zA-Z_\u0600-\u06FF\s]*)\s*[\)\]]')
+    raw_tokens = tag_regex.split(script_text)
 
-# ============ استخراج النصوص ============
+    sequence = []
+    required_assets = set()
+    cur_voice = 0
+
+    for i in range(len(raw_tokens)):
+        token = raw_tokens[i].strip()
+        if not token:
+            continue
+
+        m_v = re.match(r'^[vV]([1-5])$', token)
+        if m_v:
+            cur_voice = min(int(m_v.group(1)) - 1, max_voices - 1)
+            continue
+
+        m_s = re.match(r'^[sS]([0-9]+(?:\.[0-9]+)?)$', token)
+        if m_s:
+            sequence.append({"type": "silence", "duration": float(m_s.group(1))})
+            continue
+
+        m_mf = re.match(r'^[mM][fF](.+)$', token)
+        if m_mf:
+            asset = m_mf.group(1).strip()
+            sequence.append({"type": "mf_sound", "name": asset})
+            required_assets.add(asset)
+            continue
+
+        m_m = re.match(r'^[mM](.+)$', token)
+        if m_m:
+            asset = m_m.group(1).strip()
+            sequence.append({"type": "m_bgm_start", "name": asset})
+            required_assets.add(asset)
+            continue
+
+        m_f = re.match(r'^[fF](.+)$', token)
+        if m_f:
+            asset = m_f.group(1).strip()
+            sequence.append({"type": "m_bgm_stop", "name": asset})
+            continue
+
+        sequence.append({"type": "speech", "voice_idx": cur_voice, "text": token})
+
+    return sequence, list(required_assets)
+
+def get_user_asset_path(user_id: int, asset_name: str) -> str:
+    user_dir = os.path.join(USER_ASSETS_DIR, str(user_id))
+    os.makedirs(user_dir, exist_ok=True)
+    clean_name = re.sub(r'[^\w\u0600-\u06FF]', '_', asset_name)
+    return os.path.join(user_dir, f"{clean_name}.mp3")
+
+def find_missing_user_assets(user_id: int, assets: list) -> list:
+    missing = []
+    for a in assets:
+        path = get_user_asset_path(user_id, a)
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            missing.append(a)
+    return missing
+
+# ============ استخراج النصوص من المستندات ============
 def _sync_extract_text(path: str, ext: str) -> str:
     try:
         if ext == ".txt":
@@ -597,7 +728,7 @@ def _sync_extract_text(path: str, ext: str) -> str:
 async def extract_text_from_file(path: str, ext: str) -> str:
     return await asyncio.to_thread(_sync_extract_text, path, ext)
 
-# ============ إدارة الطابور لكل مستخدم ============
+# ============ إدارة الطوابير ============
 def get_user_queue(user_id: int) -> asyncio.Queue:
     if user_id not in USER_TASK_QUEUES:
         USER_TASK_QUEUES[user_id] = asyncio.Queue()
@@ -609,7 +740,7 @@ def get_tts_semaphore():
         GLOBAL_TTS_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TTS)
     return GLOBAL_TTS_SEMAPHORE
 
-# ============ بطاقة عرض الإعدادات المستقلة في سجل الرسائل ============
+# ============ بطاقة الإعدادات ولوحة التحكم ============
 def render_settings_card(config: dict) -> tuple:
     mode = config.get("mode", "single")
     fmt = config.get("audio_format", "mp3").upper()
@@ -617,21 +748,21 @@ def render_settings_card(config: dict) -> tuple:
 
     mode_titles = {
         "single": "🎙️ صوت فردي قياسي",
-        "story": "🎬 محرك السيناريو والقصص (متعدد الشخصيات)",
+        "story": "🎬 محرك السيناريو والمؤثرات (متعدد الشخصيات)",
         "multilang": "🌐 محرك متعدد اللغات الذكي"
     }
 
-    text = f"⚙️ **سجل الإعدادات الحالية المشغلة:**\n"
+    text = f"⚙️ **سجل الإعدادات المشغلة الحالية:**\n"
     text += f"━━━━━━━━━━━━━━━━━━━━\n"
     text += f"📌 **الوضع النشط:** {mode_titles.get(mode, mode)}\n"
     text += f"📁 **صيغة الصوت:** `{fmt}`\n"
 
     if mode in ["story", "multilang"]:
-        text += f"⏱️ **السكتة بين الأصوات:** `{pause:.1f} ثانية`\n"
+        text += f"⏱️ **السكتة الافتراضية:** `{pause:.1f} ثانية`\n"
 
     if mode == "story":
         slots = config.get("story_slots", [])
-        text += f"\n🎭 **أصوات الشخصيات ({len(slots)}):**\n"
+        text += f"\n🎭 **أصوات طاقم العمل ({len(slots)}):**\n"
         for i, s in enumerate(slots, 1):
             p_label = "همس" if s.get("pitch") == "whisper" else s.get("pitch", "normal")
             vol_pct = int(round(s.get("volume", 1.0) * 100))
@@ -639,7 +770,7 @@ def render_settings_card(config: dict) -> tuple:
 
         bgm_on = config.get("bgm_enabled", False)
         if bgm_on:
-            b_mode = "تكرار مستمر طوال السيناريو" if config.get("bgm_mode") == "loop" else f"محدد بـ {config.get('bgm_duration', 30)} ثانية"
+            b_mode = "تكرار مستمر" if config.get("bgm_mode") == "loop" else f"محدد بـ {config.get('bgm_duration', 30)} ثانية"
             text += f"\n🎵 **موسيقى خلفية:** ✅ مفعلة ({b_mode})\n"
         else:
             text += f"\n🎵 **موسيقى خلفية:** ❌ معطلة\n"
@@ -660,21 +791,20 @@ def render_settings_card(config: dict) -> tuple:
         text += f"⚡ **السرعة:** `{config.get('speed', 1.0)}x` | 🎵 **النبرة:** `{p_label}` | 🔊 **الارتفاع:** `{vol_pct}%`\n"
 
     text += f"━━━━━━━━━━━━━━━━━━━━\n"
-    text += "💡 *يمكنك تعديل أي خيار من الأزرار بالأسفل، أو إرسال أي نص/ملف وسيعمل فوراً بهذا الضبط.*"
+    text += "💡 *يتم حفظ الضبط في SQLite ويحذف تلقائياً إن غبت 10 أيام.*"
 
-    keyboard = []
-    row1 = [
-        InlineKeyboardButton("🔀 تغيير المحرك", callback_data="cfg_change_engine"),
-        InlineKeyboardButton(f"📁 الصيغة ({fmt})", callback_data="cfg_change_format"),
+    keyboard = [
+        [
+            InlineKeyboardButton("🔀 تغيير المحرك", callback_data="cfg_change_engine"),
+            InlineKeyboardButton(f"📁 الصيغة ({fmt})", callback_data="cfg_change_format"),
+        ]
     ]
-    keyboard.append(row1)
 
     if mode in ["story", "multilang"]:
-        row2 = [
+        keyboard.append([
             InlineKeyboardButton(f"⏱️ السكتة ({pause:.1f}s)", callback_data="cfg_cycle_pause"),
             InlineKeyboardButton("🎛️ تخصيص الأصوات", callback_data="cfg_open_customizer"),
-        ]
-        keyboard.append(row2)
+        ])
         if mode == "story":
             keyboard.append([
                 InlineKeyboardButton(
@@ -690,19 +820,13 @@ def render_settings_card(config: dict) -> tuple:
 
     return text, InlineKeyboardMarkup(keyboard)
 
-# ============ المعالج الرئيسي للأمر /settings ============
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    cfg = get_saved_user_config(user_id)
-    context.user_data.update(cfg)
-    text, markup = render_settings_card(context.user_data)
-    await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
-
-# ============ بداية معالج المحادثة ============
+# ============ معالجات المحادثة واختيار الأصوات بالكامل ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await gatekeeper(update, context):
+        return ConversationHandler.END
     first_name = (update.effective_user.first_name or "صديقي") if update.effective_user else "صديقي"
     user_id = str(update.effective_user.id)
-    saved = get_saved_user_config(user_id)
+    saved = db_get_config(user_id)
     context.user_data.update(saved)
 
     keyboard = [
@@ -964,7 +1088,6 @@ async def on_voice_selected(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         context.user_data["voice_name"] = voice_name
         return await ask_speed(update, context)
 
-# ============ قوائم السيناريو ومتعدد اللغات ============
 async def show_story_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     slots = context.user_data.get("story_slots", [])
@@ -1039,7 +1162,6 @@ async def handle_multilang_menu(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data["editing_idx"] = None
         return await show_sub_engines(update, context, slot_num=1, mode="multilang")
 
-# ============ شاشة تخصيص الصوت المنفرد (سرعة / نبرة همس / ارتفاع) ============
 async def show_voice_customizer(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int, mode: str):
     query = update.callback_query
     slots = context.user_data.get("story_slots" if mode == "story" else "multilang_slots", [])
@@ -1117,7 +1239,6 @@ async def handle_voice_customizer(update: Update, context: ContextTypes.DEFAULT_
 
     return await (show_story_menu(update, context) if mode == "story" else show_multilang_menu(update, context))
 
-# ============ الإعدادات الشاملة (السرعة، النبرة، السكتة، BGM) ============
 async def ask_speed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     mode = context.user_data.get("mode", "single")
@@ -1257,7 +1378,7 @@ async def select_format(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     chosen_format = query.data.replace("fmt_", "")
     context.user_data["audio_format"] = chosen_format
 
-    save_user_config(str(update.effective_user.id), context.user_data)
+    db_touch_user(str(update.effective_user.id), context.user_data)
 
     mode = context.user_data.get("mode", "single")
     prompt_text = (
@@ -1268,65 +1389,76 @@ async def select_format(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             f"{t(update, 'step_text')}\n📁 الصيغة المحددة: `({chosen_format.upper()})`"
         )
     )
-    prompt_text += "\n\n💡 *تم حفظ هذا الضبط في سجل رسائلك، ويمكنك مراجعته وتعديله بأي وقت عبر /settings*"
+    prompt_text += "\n\n💡 *تم حفظ الضبط تلقائياً، ويمكنك مراجعته عبر /settings*"
     await query.edit_message_text(prompt_text, parse_mode="Markdown")
     return STEP_TEXT
 
-# ============ أزرار التحكم من داخل سجل الإعدادات /settings ============
+# ============ أزرار لوحة /settings ============
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await gatekeeper(update, context):
+        return
+    user_id = str(update.effective_user.id)
+    cfg = db_get_config(user_id)
+    context.user_data.update(cfg)
+    text, markup = render_settings_card(context.user_data)
+    await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+
 async def handle_settings_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+
+    if data == "btn_recheck_sub":
+        ok, _ = await check_user_subscription(context.bot, update.effective_user.id)
+        if ok:
+            await query.edit_message_text("✅ **شكراً لاشتراكك! البوت مفعل وجاهز.**\nأرسل /start أو أرسل نصك مباشرة.", parse_mode="Markdown")
+        else:
+            await gatekeeper(update, context)
+        return
+
     user_id = str(update.effective_user.id)
-    cfg = get_saved_user_config(user_id)
+    cfg = db_get_config(user_id)
     context.user_data.update(cfg)
 
     if data == "cfg_change_engine":
         return await start(update, context)
-
     elif data == "cfg_change_format":
         fmts = ["mp3", "wav", "ogg"]
         cur = context.user_data.get("audio_format", "mp3")
         nxt = fmts[(fmts.index(cur) + 1) % len(fmts)]
         context.user_data["audio_format"] = nxt
-        save_user_config(user_id, context.user_data)
-
+        db_touch_user(user_id, context.user_data)
     elif data == "cfg_cycle_pause":
         pauses = [0.0, 0.3, 0.7, 1.5, 2.5]
         cur = round(context.user_data.get("pause_duration", 0.5), 1)
         closest = min(pauses, key=lambda x: abs(x - cur))
         nxt = pauses[(pauses.index(closest) + 1) % len(pauses)]
         context.user_data["pause_duration"] = nxt
-        save_user_config(user_id, context.user_data)
-
+        db_touch_user(user_id, context.user_data)
     elif data == "cfg_toggle_bgm":
         context.user_data["bgm_enabled"] = not context.user_data.get("bgm_enabled", False)
-        save_user_config(user_id, context.user_data)
-
+        db_touch_user(user_id, context.user_data)
     elif data == "cfg_cycle_bgm_dur":
         cur_mode = context.user_data.get("bgm_mode", "loop")
         if cur_mode == "loop":
-            context.user_data["bgm_mode"] = "timed"
-            context.user_data["bgm_duration"] = 15
+            context.user_data["bgm_mode"] = "timed"; context.user_data["bgm_duration"] = 15
         elif context.user_data.get("bgm_duration", 15) == 15:
             context.user_data["bgm_duration"] = 30
         elif context.user_data.get("bgm_duration", 30) == 30:
             context.user_data["bgm_duration"] = 60
         else:
             context.user_data["bgm_mode"] = "loop"
-        save_user_config(user_id, context.user_data)
-
+        db_touch_user(user_id, context.user_data)
     elif data == "cfg_open_customizer":
         mode = context.user_data.get("mode", "story")
         return await (show_story_menu(update, context) if mode == "story" else show_multilang_menu(update, context))
-
     elif data == "cfg_speed_pitch":
         return await ask_speed(update, context)
 
     text, markup = render_settings_card(context.user_data)
     await query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
 
-# ============ معالجة الطابور والتنفيذ ============
+# ============ تنفيذ الطابور والتوليد الصوتي المتقدم ============
 async def user_queue_worker(user_id: int):
     q = get_user_queue(user_id)
     while True:
@@ -1366,7 +1498,7 @@ async def enqueue_generation(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 async def execute_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str):
     user_id = str(update.effective_user.id)
-    saved = get_saved_user_config(user_id)
+    saved = db_get_config(user_id)
     context.user_data.update(saved)
 
     sem = get_tts_semaphore()
@@ -1383,6 +1515,7 @@ async def execute_generation(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 pass
 
 async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str, status_msg):
+    user_id = update.effective_user.id
     mode = context.user_data.get("mode", "single")
     audio_format = context.user_data.get("audio_format", "mp3")
     pause_duration = context.user_data.get("pause_duration", 0.5)
@@ -1403,25 +1536,41 @@ async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
         chunks = []
         caption_details = ""
 
+        # ============ 1. نمط السيناريو والمؤثرات ============
         if mode == "story":
             slots = context.user_data.get("story_slots", [])
             if not slots:
-                raise Exception("No character slots configured")
-            segments = parse_story_dialogue(user_text, len(slots))
-            for i, (v_idx, seg_text) in enumerate(segments):
-                slot = slots[v_idx]
-                sub_pieces = await split_text_semantically(seg_text, max_chars=1000)
-                for j, sp in enumerate(sub_pieces):
-                    cf = os.path.join(tmpdir, f"chunk_{i}_{j}.mp3")
-                    if await synthesize_chunk(
-                        sp, slot["engine"], slot["voice"], cf,
-                        speed=slot.get("speed", 1.0),
-                        pitch=slot.get("pitch", "normal"),
-                        volume=slot.get("volume", 1.0)
-                    ):
-                        chunks.append(cf)
-            caption_details = f"🎬 **سيناريو: {len(slots)} شخصيات** | ⏱️ سكتة: `{pause_duration}s`"
+                slots = [{"engine": "neural", "voice": "ar-EG-SalmaNeural", "speed": 1.0, "pitch": "normal", "volume": 1.0}]
+            
+            sequence, _ = parse_advanced_scenario(user_text, len(slots))
+            
+            for idx, item in enumerate(sequence):
+                piece_file = os.path.join(tmpdir, f"story_piece_{idx}.mp3")
+                
+                if item["type"] == "silence":
+                    if await create_silence(item["duration"], piece_file):
+                        chunks.append(piece_file)
 
+                elif item["type"] == "mf_sound":
+                    src = get_user_asset_path(user_id, item["name"])
+                    if os.path.exists(src) and await normalize_to_mp3(src, piece_file):
+                        chunks.append(piece_file)
+
+                elif item["type"] == "speech":
+                    slot = slots[item["voice_idx"]]
+                    sub_pieces = await split_text_semantically(item["text"], max_chars=1000)
+                    for j, sp in enumerate(sub_pieces):
+                        cf = os.path.join(tmpdir, f"sp_{idx}_{j}.mp3")
+                        if await synthesize_chunk(
+                            sp, slot["engine"], slot["voice"], cf,
+                            speed=slot.get("speed", 1.0),
+                            pitch=slot.get("pitch", "normal"),
+                            volume=slot.get("volume", 1.0)
+                        ):
+                            chunks.append(cf)
+            caption_details = f"🎬 **سيناريو احترافي: {len(slots)} شخصيات + مؤثرات صوتية**"
+
+        # ============ 2. نمط متعدد اللغات ============
         elif mode == "multilang":
             slots = context.user_data.get("multilang_slots", [])
             if not slots:
@@ -1441,6 +1590,7 @@ async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
                         chunks.append(cf)
             caption_details = f"🌐 **متعدد لغات: {len(slots)} أصوات** | ⏱️ سكتة: `{pause_duration}s`"
 
+        # ============ 3. نمط الصوت الفردي ============
         else:
             engine = context.user_data.get("engine", "neural")
             voice = context.user_data.get("voice", "ar-EG-SalmaNeural")
@@ -1487,16 +1637,103 @@ async def _do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
         except Exception:
             pass
 
-# ============ استقبال النصوص والمستندات ============
+# ============ استقبال النصوص وفحص المؤثرات المفقودة ============
+async def route_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str):
+    user_id = update.effective_user.id
+    if len(user_text) > MAX_TEXT_LEN:
+        await update.message.reply_text(f"⚠️ النص طويل جداً! الحد الأقصى هو {MAX_TEXT_LEN} حرف في المرة الواحدة.")
+        return
+
+    saved = db_get_config(str(user_id))
+    context.user_data.update(saved)
+
+    # فحص إذا كان نمط سيناريو وفيه مؤثرات غير متوفرة
+    if context.user_data.get("mode") == "story":
+        slots = context.user_data.get("story_slots", [])
+        _, required_assets = parse_advanced_scenario(user_text, len(slots) or 1)
+        if required_assets:
+            missing = find_missing_user_assets(user_id, required_assets)
+            if missing:
+                conn = sqlite3.connect(DB_FILE)
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO pending_sessions (user_id, text_data, missing_assets)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET text_data=excluded.text_data, missing_assets=excluded.missing_assets
+                """, (str(user_id), user_text, json.dumps(missing, ensure_ascii=False)))
+                conn.commit()
+                conn.close()
+
+                req_list = "\n".join([f"🔹 `{m}`" for m in missing])
+                msg = (
+                    f"🎬 **اكتشف البوت وجود مؤثرات صوتية/موسيقى داخل السيناريو!**\n\n"
+                    f"يرجى إرسال هذه الملفات الصوتية الآن (أرسلها كملف صوتي أو فويس نوت واكتب في الكابشن اسم المؤثر):\n\n"
+                    f"{req_list}\n\n"
+                    f"💡 *أرسل أول ملف وسيقوم البوت بحفظه، وبمجرد اكتمالها سيبدأ العمل تلقائياً.*"
+                )
+                await update.message.reply_text(msg, parse_mode="Markdown")
+                return
+
+    label = user_text[:20] + "..." if len(user_text) > 20 else user_text
+    await enqueue_generation(update, context, user_text, task_label=label)
+
 async def generate_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await gatekeeper(update, context):
+        return STEP_TEXT
     user_text = (update.message.text or "").strip()
     if not user_text:
         return STEP_TEXT
-    label = user_text[:20] + "..." if len(user_text) > 20 else user_text
-    await enqueue_generation(update, context, user_text, task_label=label)
+    await route_user_text(update, context, user_text)
     return STEP_TEXT
 
+# ============ استقبال التسجيلات الصوتية المطلوبة للمؤثرات ============
+async def handle_user_audio_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await gatekeeper(update, context):
+        return
+    user_id = update.effective_user.id
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT text_data, missing_assets FROM pending_sessions WHERE user_id = ?", (str(user_id),))
+    row = cur.fetchone()
+
+    if not row:
+        await update.message.reply_text("💡 ليس لديك سيناريو معلق يحتاج تسجيلات صوتية حالياً. أرسل النص أولاً!")
+        conn.close()
+        return
+
+    user_text, missing_assets = row[0], json.loads(row[1])
+    audio_obj = update.message.audio or update.message.voice
+    caption = (update.message.caption or "").strip()
+
+    target = caption if caption in missing_assets else missing_assets[0]
+    save_path = get_user_asset_path(user_id, target)
+    file_info = await audio_obj.get_file()
+    await file_info.download_to_drive(save_path)
+
+    missing_assets.remove(target)
+
+    if missing_assets:
+        cur.execute("UPDATE pending_sessions SET missing_assets = ? WHERE user_id = ?",
+                    (json.dumps(missing_assets, ensure_ascii=False), str(user_id)))
+        conn.commit()
+        conn.close()
+        await update.message.reply_text(
+            f"✅ تم استلام وحفظ المؤثر: `{target}`!\n"
+            f"متبقي منك الملفات الآتية:\n" + "\n".join([f"🔹 `{m}`" for m in missing_assets]),
+            parse_mode="Markdown"
+        )
+    else:
+        cur.execute("DELETE FROM pending_sessions WHERE user_id = ?", (str(user_id),))
+        conn.commit()
+        conn.close()
+        await update.message.reply_text(f"🎉 اكتمل استلام جميع الأصوات للمؤثر `{target}`!\nيبدأ توليد السيناريو فوراً...")
+        label = user_text[:20] + "..." if len(user_text) > 20 else user_text
+        await enqueue_generation(update, context, user_text, task_label=label)
+
+# ============ معالجة المستندات ============
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await gatekeeper(update, context):
+        return STEP_TEXT
     doc = update.message.document
     if not doc:
         return STEP_TEXT
@@ -1521,7 +1758,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await status.edit_text(t(update, "doc_no_text"))
             return STEP_TEXT
         await status.delete()
-        await enqueue_generation(update, context, text, task_label=file_name)
+        await route_user_text(update, context, text)
         return STEP_TEXT
     except Exception as e:
         logger.error(f"Doc error: {e}")
@@ -1533,18 +1770,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-# ============ استجابة مباشرة خارج دورة start ============
+# ============ رسائل الدردشة المباشرة ============
 async def direct_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    saved = get_saved_user_config(user_id)
-    context.user_data.update(saved)
-    return await generate_audio(update, context)
+    if not await gatekeeper(update, context):
+        return
+    text = (update.message.text or "").strip()
+    if text:
+        await route_user_text(update, context, text)
 
 async def direct_document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    saved = get_saved_user_config(user_id)
-    context.user_data.update(saved)
-    return await handle_document(update, context)
+    if not await gatekeeper(update, context):
+        return
+    await handle_document(update, context)
 
 async def noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1556,13 +1793,23 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("تم إلغاء المسار. أرسل /settings لضبط إعداداتك أو أرسل نصك مباشرة.")
     return ConversationHandler.END
 
-# ============ بدء التشغيل والإغلاق ============
+# ============ مهام الخلفية والتشغيل ============
+async def background_pruner():
+    while True:
+        try:
+            db_prune_inactive(days=10)
+        except Exception as e:
+            logger.error(f"Background prune error: {e}")
+        await asyncio.sleep(86400)
+
 async def on_startup(app):
-    print("⏳ جاري فحص وتحضير مكتبات الصوت...")
+    print("⏳ جاري تهيئة قاعدة بيانات SQLite وتحضير محركات الأصوات...")
+    init_db()
     await init_neural_json()
     init_fast_json()
     init_creative_json()
-    print("✅ تم بنجاح تشغيل البوت الذكي بنظام سجل الرسائل والتخصيص الكامل!")
+    asyncio.create_task(background_pruner())
+    print("✅ البوت الضخم المتكامل جاهز للعمل بكامل الميزات وبدون أي اختصارات!")
 
 async def on_shutdown(app):
     global GLOBAL_HTTP_SESSION
@@ -1618,16 +1865,16 @@ def main():
         ],
     )
 
-    # معالج أمر الإعدادات المستقل وزر تحكم سجل الرسائل
     app.add_handler(CommandHandler("settings", settings_command))
-    app.add_handler(CallbackQueryHandler(handle_settings_callbacks, pattern="^cfg_"))
+    app.add_handler(CallbackQueryHandler(handle_settings_callbacks, pattern="^(cfg_|btn_recheck_sub)"))
+    app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_user_audio_upload))
 
     app.add_handler(conv_handler)
-    # معالجات مباشرة تسمح بالتحويل الفوري لأي نص يرسل مباشرة بدون إعادة الإعدادات
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, direct_message_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, direct_document_handler))
 
-    print("🚀 البوت متصل وجاهز للعمل بأقصى سرعة وإبداع...")
+    print("🚀 البوت متصل وجاهز للعمل بأقصى استقرار واحترافية...")
     app.run_polling(close_loop=False, drop_pending_updates=True)
 
 if __name__ == "__main__":
