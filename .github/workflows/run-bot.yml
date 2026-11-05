@@ -2,62 +2,97 @@ name: Run Telegram TTS Bot
 
 on:
   schedule:
-    # يعمل بانتظام كل 4 ساعات (00, 04, 08, 12, 16, 20) لضمان تقسيم اليوم بالتساوي بدون أي خلل
+    # يعمل بانتظام كل 4 ساعات دون أي خلل زمني
     - cron: '0 */4 * * *'
   push:
     branches: [ main ]
   workflow_dispatch:
 
-concurrency:
-  group: telegram-tts-bot
-  cancel-in-progress: true
+permissions:
+  actions: write
+  contents: write
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 260 # حد أقصى آمن للجلسة (أقل من الـ 6 ساعات المسموحة)
+    timeout-minutes: 250
 
     steps:
-      # الخطوة 1: جلب الكود
+      # 1. سحب كود المشروع
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      # الخطوة 2: تثبيت FFmpeg
-      - name: Install FFmpeg
+      # 2. استرجاع قاعدة البيانات الدائمة من فرع التخزين
+      - name: Restore Persistent Database
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends ffmpeg
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --heads origin data-storage | grep -q data-storage; then
+            echo "📥 جاري سحب قاعدة البيانات الدائمة..."
+            git fetch origin data-storage
+            git checkout origin/data-storage -- bot_database.db || true
+          else
+            echo "ℹ️ فرع التخزين غير موجود بعد، سيتم إنشاؤه تلقائياً."
+          fi
 
-      # الخطوة 3: تثبيت بايثون مع الكاش لتوفير الوقت
+      # 3. تثبيت سريع جداً لـ FFmpeg (ثوانٍ معدودة)
+      - name: Fast Install FFmpeg
+        uses: FedericoCarboni/setup-ffmpeg@v3
+        with:
+          ffmpeg-version: release
+
+      # 4. تثبيت بايثون مع الكاش
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
 
-      # الخطوة 4: تثبيت المكتبات
+      # 5. تثبيت المكتبات بسرعة
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # الخطوة 5: تشغيل البوت بنظام الحراسة الذاتية وإعادة التشغيل التلقائي
-      - name: Run Bot with Auto-Restart Loop
+      # 6. لحظة التسليم والتسلم: إغلاق الجلسة القديمة الآن فقط بعد أن أصبحنا جاهزين بنسبة 100%
+      - name: Terminate Old Session Right Before Launch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "🔄 نحن جاهزون الآن! جاري إغلاق أي جلسات سابقة لضمان عدم حدوث تضارب..."
+          for run_id in $(gh run list --repo "$GITHUB_REPOSITORY" --workflow "Run Telegram TTS Bot" --status in_progress --json databaseId -q '.[].databaseId'); do
+            if [ "$run_id" != "$GITHUB_RUN_ID" ]; then
+              echo "إيقاف الجلسة القديمة رقم: $run_id"
+              gh run cancel "$run_id" --repo "$GITHUB_REPOSITORY" || true
+            fi
+          done
+          sleep 3
+
+      # 7. تشغيل البوت مع الحراسة التلقائية
+      - name: Run Bot & Auto-Restart
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: |
-          echo "🚀 جاري تشغيل البوت بحماية عدم السقوط..."
-          
-          # يعمل لمدة 3 ساعات و 55 دقيقة متواصلة ثم يسلّم الجلسة التالية بسلاسة
-          # وإذا سقط بايثون لأي سبب يعيد تشغيله فوراً خلال ثانيتين دون إغلاق السيرفر
+          echo "🚀 تشغيل البوت بنظام الاستوديو المتعدد..."
           timeout 235m bash -c '
             while true; do
-              echo "⏳ تشغيل bot.py الآن..."
               python bot.py
               EXIT_CODE=$?
-              echo "⚠️ توقف البوت بكود ($EXIT_CODE)! إعادة التشغيل فوراً بعد ثانيتين..."
+              echo "⚠️ توقف البوت بكود ($EXIT_CODE). إعادة التشغيل فوراً..."
               sleep 2
             done
           ' || true
-          
-          echo "✅ انتهت دورة الجلسة الحالية بنجاح، جاري التبديل للجلسة التالية..."
+
+      # 8. حفظ قاعدة البيانات في فرع التخزين قبل إنهاء السيرفر
+      - name: Backup Database to Storage Branch
+        if: always()
+        run: |
+          if [ -f bot_database.db ]; then
+            echo "💾 جاري حفظ نسخة احتياطية من قاعدة البيانات..."
+            git checkout -B data-storage
+            git add -f bot_database.db
+            git commit -m "Auto-backup database [skip ci]" || true
+            git push origin data-storage --force || true
+          fi
