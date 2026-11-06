@@ -2,7 +2,7 @@ name: Run Telegram TTS Bot
 
 on:
   schedule:
-    # يعمل بانتظام كل 4 ساعات دون أي خلل زمني
+    # يعمل بانتظام كل 4 ساعات
     - cron: '0 */4 * * *'
   push:
     branches: [ main ]
@@ -24,20 +24,27 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 2. استرجاع قاعدة البيانات الدائمة من فرع التخزين
-      - name: Restore Persistent Database
+      # 2. استرجاع قاعدة البيانات مباشرة من مستودع data الخاص
+      - name: Restore Persistent Database from data repo
+        env:
+          ADM_TOKEN: ${{ secrets.ADM }}
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          if git ls-remote --heads origin data-storage | grep -q data-storage; then
-            echo "📥 جاري سحب قاعدة البيانات الدائمة..."
-            git fetch origin data-storage
-            git checkout origin/data-storage -- bot_database.db || true
+          echo "📥 جاري فحص واسترجاع قاعدة البيانات من مستودع data..."
+          if git clone "https://${ADM_TOKEN}@github.com/ahmedhassan2382006-art/data.git" temp_data; then
+            if [ -f temp_data/bot_database.db ]; then
+              cp temp_data/bot_database.db ./bot_database.db
+              echo "✅ تم بنجاح جلب قاعدة البيانات الأصلية من مستودع data!"
+            else
+              echo "ℹ️ مستودع data لا يحتوي بعد على bot_database.db، سيتم إنشاؤها الآن."
+            fi
+            rm -rf temp_data
           else
-            echo "ℹ️ فرع التخزين غير موجود بعد، سيتم إنشاؤه تلقائياً."
+            echo "⚠️ تعذر الاتصال بمستودع data، تأكد من صحة التوكن ADM وصلاحيات الـ repo."
           fi
 
-      # 3. تثبيت سريع جداً لـ FFmpeg (ثوانٍ معدودة)
+      # 3. تثبيت FFmpeg
       - name: Fast Install FFmpeg
         uses: FedericoCarboni/setup-ffmpeg@v3
         with:
@@ -50,32 +57,33 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      # 5. تثبيت المكتبات بسرعة
+      # 5. تثبيت المكتبات
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 6. لحظة التسليم والتسلم: إغلاق الجلسة القديمة الآن فقط بعد أن أصبحنا جاهزين بنسبة 100%
+      # 6. إغلاق الجلسة السابقة لمنع التضارب
       - name: Terminate Old Session Right Before Launch
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          echo "🔄 نحن جاهزون الآن! جاري إغلاق أي جلسات سابقة لضمان عدم حدوث تضارب..."
+          echo "🔄 جاري فحص وإغلاق أي جلسات سابقة..."
           for run_id in $(gh run list --repo "$GITHUB_REPOSITORY" --workflow "Run Telegram TTS Bot" --status in_progress --json databaseId -q '.[].databaseId'); do
             if [ "$run_id" != "$GITHUB_RUN_ID" ]; then
-              echo "إيقاف الجلسة القديمة رقم: $run_id"
+              echo "إيقاف الجلسة رقم: $run_id"
               gh run cancel "$run_id" --repo "$GITHUB_REPOSITORY" || true
             fi
           done
           sleep 3
 
-      # 7. تشغيل البوت مع الحراسة التلقائية
+      # 7. تشغيل البوت (تمت إضافة ADM هنا ليعمل الرفع كل 7 دقائق من داخل بايثون)
       - name: Run Bot & Auto-Restart
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADM: ${{ secrets.ADM }}
         run: |
-          echo "🚀 تشغيل البوت بنظام الاستوديو المتعدد..."
+          echo "🚀 تشغيل البوت بنظام الاستوديو والنسخ الاحتياطي..."
           timeout 235m bash -c '
             while true; do
               python bot.py
@@ -85,14 +93,30 @@ jobs:
             done
           ' || true
 
-      # 8. حفظ قاعدة البيانات في فرع التخزين قبل إنهاء السيرفر
-      - name: Backup Database to Storage Branch
+      # 8. حفظ ورفع قاعدة البيانات قاطعاً إلى مستودع data (فرع main) عند انتهاء السيرفر
+      - name: Backup Database to data repository (main branch)
         if: always()
+        env:
+          ADM_TOKEN: ${{ secrets.ADM }}
         run: |
           if [ -f bot_database.db ]; then
-            echo "💾 جاري حفظ نسخة احتياطية من قاعدة البيانات..."
-            git checkout -B data-storage
-            git add -f bot_database.db
-            git commit -m "Auto-backup database [skip ci]" || true
-            git push origin data-storage --force || true
+            echo "💾 جاري رفع النسخة النهائية إلى مستودع ahmedhassan2382006-art/data..."
+            rm -rf repo_data
+            mkdir repo_data
+            cd repo_data
+            git init -b main
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git remote add origin "https://${ADM_TOKEN}@github.com/ahmedhassan2382006-art/data.git"
+            git pull origin main || true
+            
+            # نسخ قاعدة البيانات الأساسية مع نسخة مؤرخة بالتاريخ والوقت
+            cp ../bot_database.db ./bot_database.db
+            NOW=$(date -u +"%Y-%m-%d_%H-%M-%S")
+            cp ../bot_database.db "./backup_${NOW}.db"
+            
+            git add -A
+            git commit -m "Auto-backup database at ${NOW} [skip ci]" || true
+            git push -u origin main --force || true
+            echo "🎉 تم بنجاح تأكيد رفع قاعدة البيانات إلى مستودع data (main)!"
           fi
