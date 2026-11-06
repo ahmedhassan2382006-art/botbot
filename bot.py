@@ -200,7 +200,7 @@ DEFAULT_CONFIG = {
     "settings_saved": False,
     "multilang_slots": [
         {"engine": "neural", "lang": "ar", "voice": "ar-EG-SalmaNeural", "voice_name": "Salma (🇪🇬)", "speed": 1.0, "pitch": "normal"},
-        {"engine": "creative", "lang": "en", "voice": "en_us_006", "voice_name": "Joey (🇺🇸)", "speed": 1.0, "pitch": "normal"},
+        {"engine": "neural", "lang": "en", "voice": "en-US-ChristopherNeural", "voice_name": "Christopher (🇺🇸)", "speed": 1.0, "pitch": "normal"},
         {"engine": "neural", "lang": "zh", "voice": "zh-CN-XiaoxiaoNeural", "voice_name": "Xiaoxiao (🇨🇳)", "speed": 1.0, "pitch": "normal"}
     ]
 }
@@ -323,7 +323,7 @@ async def periodic_backup_task():
         logger.error(f"خطأ أثناء مهمة النسخ الاحتياطي الأولى: {e}")
 
     while True:
-        await asyncio.sleep(420)  # كل 7 دقائق = 420 ثانية
+        await asyncio.sleep(780)  # رفع دوري كل 13 دقيقة (780 ثانية)
         try:
             await github_upload_backup()
         except Exception as e:
@@ -417,6 +417,10 @@ async def check_user_subscription(bot, user_id: int) -> tuple[bool, list]:
     return (len(missing) == 0, missing)
 
 async def gatekeeper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    # عدم التفاعل إطلاقاً أو إرسال أي رسائل خارج المحادثات الخاصة
+    if update.effective_chat and update.effective_chat.type != "private":
+        return False
+
     user = update.effective_user
     if not user:
         return False
@@ -536,7 +540,7 @@ def get_engine_supported_langs(engine: str) -> list:
         return [l for l in LANGUAGES_30.keys() if l in DB_FAST]
     return [l for l in LANGUAGES_30.keys() if l in DB_NEURAL]
 
-# ============ اقتصاص الصمت لمنع السكتات ============
+# ============ اقتصاص الصمت لمنع السكتات وضمان سلامة الصوت ============
 async def run_ffmpeg(args: list, timeout: int = 240) -> bool:
     if not shutil.which("ffmpeg"):
         return False
@@ -551,19 +555,28 @@ async def run_ffmpeg(args: list, timeout: int = 240) -> bool:
         return False
 
 async def trim_silence(input_file: str, output_file: str) -> bool:
-    """إزالة الصمت الهامشي بالكامل لمنع السكتات والتأخير بين الأصوات"""
+    """إزالة الصمت الهامشي وتوحيد تردد المقطع الصوتي لمنع السكتات أو كتم الصوت نهائياً"""
     filter_chain = (
-        "silenceremove=start_periods=1:start_duration=0.02:start_threshold=-45dB:detection=peak,"
+        "silenceremove=start_periods=1:start_duration=0.03:start_threshold=-50dB:detection=rms,"
         "areverse,"
-        "silenceremove=start_periods=1:start_duration=0.02:start_threshold=-45dB:detection=peak,"
+        "silenceremove=start_periods=1:start_duration=0.03:start_threshold=-50dB:detection=rms,"
         "areverse"
     )
     ok = await run_ffmpeg([
         "-i", input_file, "-af", filter_chain,
-        "-c:a", "libmp3lame", "-q:a", "2", "-y", output_file
+        "-ar", "44100", "-ac", "2", "-c:a", "libmp3lame", "-b:a", "192k", "-y", output_file
     ])
-    if ok and os.path.exists(output_file) and os.path.getsize(output_file) > 100:
+    # التأكد من صحة الملف ووجود صوت فعلي (أكبر من 3 كيلوبايت)
+    if ok and os.path.exists(output_file) and os.path.getsize(output_file) > 3000:
         return True
+
+    # في حال فشل الفلتر أو حذف المقطع بالكامل، يتم تحويل الملف الأصلي بتردد موحد لضمان سلامته
+    await run_ffmpeg([
+        "-i", input_file, "-ar", "44100", "-ac", "2", "-c:a", "libmp3lame", "-b:a", "192k", "-y", output_file
+    ])
+    if os.path.exists(output_file) and os.path.getsize(output_file) > 500:
+        return True
+
     shutil.copy(input_file, output_file)
     return True
 
@@ -599,37 +612,62 @@ async def synthesize_chunk(text: str, engine: str, voice: str, out_file: str,
             "sharp": "+40Hz"
         }
         vol_str = "-25%" if pitch == "whisper" else "+0%"
-        comm = edge_tts.Communicate(
-            text=clean_text, voice=voice, rate=rate_str,
-            pitch=pitch_map.get(pitch, "+0Hz"), volume=vol_str
-        )
-        await comm.save(out_file)
-        return True
+        try:
+            comm = edge_tts.Communicate(
+                text=clean_text, voice=voice, rate=rate_str,
+                pitch=pitch_map.get(pitch, "+0Hz"), volume=vol_str
+            )
+            await comm.save(out_file)
+            return os.path.exists(out_file) and os.path.getsize(out_file) > 500
+        except Exception as e:
+            logger.error(f"Neural engine error: {e}")
+            return False
+
     elif engine == "fast":
-        tts_lang = "zh-CN" if voice == "zh" else voice
-        tts = gTTS(text=clean_text, lang=tts_lang)
-        await asyncio.to_thread(tts.save, out_file)
-        if abs(speed - 1.0) > 0.01:
-            tmp = out_file + ".f.mp3"
-            if await apply_audio_filters(out_file, tmp, speed):
-                os.replace(tmp, out_file)
-        return True
+        try:
+            tts_lang = "zh-CN" if voice == "zh" else voice
+            tts = gTTS(text=clean_text, lang=tts_lang)
+            await asyncio.to_thread(tts.save, out_file)
+            if abs(speed - 1.0) > 0.01:
+                tmp = out_file + ".f.mp3"
+                if await apply_audio_filters(out_file, tmp, speed):
+                    os.replace(tmp, out_file)
+            return os.path.exists(out_file) and os.path.getsize(out_file) > 500
+        except Exception as e:
+            logger.error(f"Fast engine error: {e}")
+            return False
+
     else:
-        global GLOBAL_HTTP_SESSION
-        if GLOBAL_HTTP_SESSION is None or GLOBAL_HTTP_SESSION.closed:
-            GLOBAL_HTTP_SESSION = aiohttp.ClientSession()
-        api_url = "https://tiktok-tts.weilnet.workers.dev/api/generation"
-        async with GLOBAL_HTTP_SESSION.post(api_url, json={"text": clean_text, "voice": voice}) as resp:
-            data = await resp.json()
-            if "data" in data and data["data"]:
-                with open(out_file, "wb") as f:
-                    f.write(base64.b64decode(data["data"]))
-                if abs(speed - 1.0) > 0.01:
-                    tmp = out_file + ".f.mp3"
-                    if await apply_audio_filters(out_file, tmp, speed):
-                        os.replace(tmp, out_file)
-                return True
-        return False
+        # المحرك التعبيري مع نظام احتياطي تلقائي لمنع السكون التام
+        try:
+            global GLOBAL_HTTP_SESSION
+            if GLOBAL_HTTP_SESSION is None or GLOBAL_HTTP_SESSION.closed:
+                GLOBAL_HTTP_SESSION = aiohttp.ClientSession()
+            api_url = "https://tiktok-tts.weilnet.workers.dev/api/generation"
+            async with GLOBAL_HTTP_SESSION.post(api_url, json={"text": clean_text, "voice": voice}, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data and "data" in data and data["data"]:
+                        decoded_bytes = base64.b64decode(data["data"])
+                        if len(decoded_bytes) > 500:
+                            with open(out_file, "wb") as f:
+                                f.write(decoded_bytes)
+                            if abs(speed - 1.0) > 0.01:
+                                tmp = out_file + ".f.mp3"
+                                if await apply_audio_filters(out_file, tmp, speed):
+                                    os.replace(tmp, out_file)
+                            return True
+        except Exception as e:
+            logger.warning(f"Creative engine failed, falling back to neural: {e}")
+
+        # Fallback تلقائي لصوت Studio ذكي لضمان خروج صوت دائماً
+        try:
+            comm = edge_tts.Communicate(text=clean_text, voice="en-US-ChristopherNeural")
+            await comm.save(out_file)
+            return os.path.exists(out_file) and os.path.getsize(out_file) > 500
+        except Exception as e:
+            logger.error(f"Fallback synthesis error: {e}")
+            return False
 
 # ============ كاشف النصوص التلقائي ============
 def detect_token_script(token: str) -> str:
@@ -763,6 +801,9 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, slo
 
 # ============ أوامر البوت ============
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat and update.effective_chat.type != "private":
+        return
+
     user_id = str(update.effective_user.id)
     cfg = db_get_config(user_id)
 
@@ -787,6 +828,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_main_menu(update, context, text_override=t("welcome_new", blang, name=first_name))
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat and update.effective_chat.type != "private":
+        return
+
     user_id = str(update.effective_user.id)
     cfg = db_get_config(user_id)
     context.user_data.update(cfg)
@@ -796,6 +840,9 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ معالجة اختيارات الأزرار والقوائم ============
 async def handle_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat and update.effective_chat.type != "private":
+        return
+
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -1194,10 +1241,13 @@ async def execute_render(update: Update, context: ContextTypes.DEFAULT_TYPE, use
                     chunk_text, slot["engine"], slot["voice"], raw_chunk,
                     speed=slot.get("speed", 1.0), pitch=slot.get("pitch", "normal")
                 )
-                if ok and os.path.exists(raw_chunk) and os.path.getsize(raw_chunk) > 0:
-                    # إزالة الصمت لضمان عدم وجود أي سكتات بين اللغات
+                if ok and os.path.exists(raw_chunk) and os.path.getsize(raw_chunk) > 100:
+                    # اقتصاص وتوحيد التردد لمنع السكتات وانعدام الصوت
                     await trim_silence(raw_chunk, trimmed_chunk)
-                    chunks.append(trimmed_chunk)
+                    if os.path.exists(trimmed_chunk) and os.path.getsize(trimmed_chunk) > 100:
+                        chunks.append(trimmed_chunk)
+                    else:
+                        chunks.append(raw_chunk)
         else:
             engine = cfg.get("engine", "neural")
             voice = cfg.get("voice", "ar-EG-SalmaNeural")
@@ -1205,7 +1255,7 @@ async def execute_render(update: Update, context: ContextTypes.DEFAULT_TYPE, use
             pit = cfg.get("pitch", "normal")
             cf = os.path.join(tmpdir, "single.mp3")
             ok = await synthesize_chunk(user_text, engine, voice, cf, speed=spd, pitch=pit)
-            if ok and os.path.exists(cf) and os.path.getsize(cf) > 0:
+            if ok and os.path.exists(cf) and os.path.getsize(cf) > 100:
                 chunks.append(cf)
 
         if not chunks:
@@ -1217,12 +1267,13 @@ async def execute_render(update: Update, context: ContextTypes.DEFAULT_TYPE, use
                 f.write(f"file '{os.path.abspath(c).replace(chr(92), '/')}'\n")
 
         final_out = os.path.join(tmpdir, f"out.{audio_format}")
+        # إعادة ترميز لضمان دمج سليم بدون أخطاء تزامن أو كتم الصوت
         if audio_format == "wav":
-            await run_ffmpeg(["-f", "concat", "-safe", "0", "-i", list_file, "-c:a", "pcm_s16le", "-y", final_out])
+            await run_ffmpeg(["-f", "concat", "-safe", "0", "-i", list_file, "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", "-y", final_out])
         elif audio_format == "ogg":
             await run_ffmpeg(["-f", "concat", "-safe", "0", "-i", list_file, "-c:a", "libopus", "-b:a", "64k", "-y", final_out])
         else:
-            await run_ffmpeg(["-f", "concat", "-safe", "0", "-i", list_file, "-c", "copy", "-y", final_out])
+            await run_ffmpeg(["-f", "concat", "-safe", "0", "-i", list_file, "-ar", "44100", "-ac", "2", "-c:a", "libmp3lame", "-b:a", "192k", "-y", final_out])
 
         with open(final_out, "rb") as af:
             if audio_format == "ogg":
@@ -1235,6 +1286,8 @@ async def execute_render(update: Update, context: ContextTypes.DEFAULT_TYPE, use
 
 # ============ استقبال النصوص والمستندات ============
 async def handle_incoming_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat and update.effective_chat.type != "private":
+        return
     if not await gatekeeper(update, context): return
     txt = (update.message.text or "").strip()
     if txt:
@@ -1247,6 +1300,8 @@ async def handle_incoming_text(update: Update, context: ContextTypes.DEFAULT_TYP
         await q.put((update, context, txt, status_msg))
 
 async def handle_incoming_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat and update.effective_chat.type != "private":
+        return
     if not await gatekeeper(update, context): return
     doc = update.message.document
     if not doc: return
@@ -1303,7 +1358,7 @@ async def on_startup(app):
     init_creative_json()
     asyncio.create_task(background_pruner())
     asyncio.create_task(global_queue_worker())
-    asyncio.create_task(periodic_backup_task())  # رفع دوري كل 7 دقائق لمستودع data
+    asyncio.create_task(periodic_backup_task())  # رفع دوري كل 13 دقيقة لمستودع data
     print("🚀 البوت يعمل بنظام الـ 30 لغة وقص السكتات والنسخ الاحتياطي الصارم!")
 
 def main():
@@ -1315,12 +1370,13 @@ def main():
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("settings", settings_command))
+    # حصر المعالجات على المحادثات الخاصة حصراً لمنع إرسال أي رسائل بالمجموعات والقنوات
+    app.add_handler(CommandHandler("start", start_command, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("settings", settings_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(CallbackQueryHandler(noop_cb, pattern="^noop$"))
     app.add_handler(CallbackQueryHandler(handle_callback_router))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_incoming_text))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_incoming_doc))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_incoming_text))
+    app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, handle_incoming_doc))
 
     app.run_polling(drop_pending_updates=True)
 
